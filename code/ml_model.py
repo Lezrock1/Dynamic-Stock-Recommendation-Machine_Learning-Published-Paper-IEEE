@@ -18,13 +18,10 @@ from sklearn.ensemble import AdaBoostRegressor
 
 from sklearn.model_selection import TimeSeriesSplit, GridSearchCV,RandomizedSearchCV
 
-from keras.models import Sequential
-from keras.layers import Dense
-from keras.layers import LSTM
-from keras.layers import Dropout
-
 import os
 import errno
+
+MAX_SEARCH_JOBS = min(4, os.cpu_count() or 1)
 
 
 def prepare_rolling_train(df,features_column,label_column,date_column,unique_datetime,testing_windows,first_trade_date_index, max_rolling_window_index,current_index):
@@ -48,6 +45,7 @@ def prepare_rolling_test(df,features_column,label_column,date_column,unique_date
 
 def prepare_trade_data(df,features_column,label_column,date_column,tic_column,unique_datetime,testing_windows,fist_trade_date_index, current_index):
     trade  = df[df[date_column] == unique_datetime[current_index]]
+    trade = trade.drop_duplicates(subset=[tic_column], keep='last')
     X_trade = trade[features_column]
     y_trade = trade[label_column]
     trade_tic = trade[tic_column].values
@@ -60,6 +58,59 @@ def train_linear_regression(X_train,y_train):
     model = lr_regressor.fit(X_train, y_train)
     
     return model
+
+
+class StepwiseAICRegressor:
+    def fit(self, X, y):
+        self.feature_names_ = list(X.columns)
+        matrix = X.to_numpy(dtype=float)
+        target = np.asarray(y, dtype=float)
+        sample_count, feature_count = matrix.shape
+        selected = []
+
+        def aic(indices):
+            design = np.column_stack([np.ones(sample_count), matrix[:, indices]])
+            coefficients = np.linalg.lstsq(design, target, rcond=None)[0]
+            residuals = target - design @ coefficients
+            rss = max(float(residuals @ residuals), np.finfo(float).tiny)
+            return sample_count * np.log(rss / sample_count) + 2 * design.shape[1]
+
+        current_aic = aic(selected)
+        while len(selected) < feature_count:
+            candidates = [i for i in range(feature_count) if i not in selected]
+            if not candidates:
+                break
+            candidate_aics = [(aic(selected + [i]), i) for i in candidates]
+            candidate_aic, candidate = min(candidate_aics)
+            if candidate_aic >= current_aic:
+                break
+            selected.append(candidate)
+            current_aic = candidate_aic
+
+            while selected:
+                removal_aics = [(aic([i for i in selected if i != removed]), removed) for removed in selected]
+                removal_aic, removed = min(removal_aics)
+                if removal_aic >= current_aic:
+                    break
+                selected.remove(removed)
+                current_aic = removal_aic
+
+        self.selected_features_ = [self.feature_names_[i] for i in selected]
+        if self.selected_features_:
+            self.model_ = LinearRegression().fit(X[self.selected_features_], y)
+        else:
+            self.model_ = None
+            self.mean_ = float(np.mean(target))
+        return self
+
+    def predict(self, X):
+        if self.model_ is None:
+            return np.full(len(X), self.mean_)
+        return self.model_.predict(X[self.selected_features_])
+
+
+def train_stepwise_regression(X_train, y_train):
+    return StepwiseAICRegressor().fit(X_train, y_train)
 
 def train_recursive_feature_elimination(X_train,y_train):
 
@@ -132,7 +183,7 @@ def train_random_forest(X_train, y_train):
     randomforest_regressor = GridSearchCV(estimator=rf, 
                                           param_grid=random_grid,
                                           cv=3, 
-                                          n_jobs=-1, 
+                                          n_jobs=MAX_SEARCH_JOBS,
                                           scoring=scoring_method, 
                                           verbose=0)  
     
@@ -160,7 +211,7 @@ def train_svm(X_train, y_train):
     scoring_method = 'neg_mean_squared_error'
     #scoring_method = 'neg_mean_squared_log_error'
     
-    svm_regressor = GridSearchCV(estimator=svr, param_grid =param_grid_svm, cv=3, n_jobs=-1, scoring=scoring_method, verbose=0)
+    svm_regressor = GridSearchCV(estimator=svr, param_grid =param_grid_svm, cv=3, n_jobs=MAX_SEARCH_JOBS, scoring=scoring_method, verbose=0)
     
     svm_regressor.fit(X_train, y_train)
     model = svm_regressor.best_estimator_
@@ -182,7 +233,7 @@ def train_gbm(X_train, y_train):
     scoring_method = 'neg_mean_squared_error'
     #scoring_method = 'neg_mean_squared_log_error'
     gbm_regressor = GridSearchCV(estimator=gbm, param_grid=param_grid_gbm,
-                                       cv=3, n_jobs=-1, scoring=scoring_method, verbose=0)
+                                       cv=3, n_jobs=MAX_SEARCH_JOBS, scoring=scoring_method, verbose=0)
 
     gbm_regressor.fit(X_train, y_train)
     model = gbm_regressor.best_estimator_
@@ -210,7 +261,7 @@ def train_ada(X_train, y_train):
     #scoring_method = 'neg_mean_squared_log_error'
 
     ada_regressor = GridSearchCV(estimator=ada, param_distributions=param_grid_ada,
-                                       cv=3, n_jobs=-1, scoring=scoring_method, verbose=0)
+                                       cv=3, n_jobs=MAX_SEARCH_JOBS, scoring=scoring_method, verbose=0)
 
     ada_regressor.fit(X_train, y_train)
     model = ada_regressor.best_estimator_
@@ -243,22 +294,24 @@ def evaluate_model(model, X_test, y_test):
 
 
 def append_return_table(df_predict, unique_datetime, y_trade_return, trade_tic, current_index):
-    tmp_table = pd.DataFrame(columns=trade_tic)
-    tmp_table = tmp_table.append(pd.Series(y_trade_return, index=trade_tic), ignore_index=True)
-    df_predict.loc[unique_datetime[current_index]][tmp_table.columns] = tmp_table.loc[0]
+    row = pd.Series(y_trade_return, index=trade_tic)
+    row = row.groupby(level=0, sort=False).last()
+    df_predict.loc[unique_datetime[current_index], row.index] = row.values
 
 
 def run_4model(df,features_column, label_column,date_column,tic_column,
               unique_ticker, unique_datetime, trade_date, 
               first_trade_date_index=20,
               testing_windows=4,
-              max_rolling_window_index=44):
+              max_rolling_window_index=44,
+              trade_start_date=None):
     ## initialize all the result tables
     ## need date as index and unique tic name as columns
     df_predict_lr = pd.DataFrame(columns=unique_ticker, index=trade_date)
     df_predict_rf = pd.DataFrame(columns=unique_ticker, index=trade_date)
     df_predict_ridge = pd.DataFrame(columns=unique_ticker, index=trade_date)
     df_predict_gbm = pd.DataFrame(columns=unique_ticker, index=trade_date)
+    df_predict_step = pd.DataFrame(columns=unique_ticker, index=trade_date)
 
     df_predict_best = pd.DataFrame(columns=unique_ticker, index=trade_date)
     df_best_model_name = pd.DataFrame(columns=['model_name'], index=trade_date)
@@ -268,6 +321,8 @@ def run_4model(df,features_column, label_column,date_column,tic_column,
     # testing_windows = 6
 
     for i in range(first_trade_date_index, len(unique_datetime)):
+        if trade_start_date is not None and unique_datetime[i] < trade_start_date:
+            continue
         try:
             # prepare training data
             X_train, y_train = prepare_rolling_train(df, 
@@ -307,6 +362,7 @@ def run_4model(df,features_column, label_column,date_column,tic_column,
             rf_model = train_random_forest(X_train, y_train)
             ridge_model = train_ridge(X_train, y_train)
             gbm_model = train_gbm(X_train, y_train)
+            step_model = train_stepwise_regression(X_train, y_train)
 
 
             # Validation
@@ -314,22 +370,24 @@ def run_4model(df,features_column, label_column,date_column,tic_column,
             rf_eval = evaluate_model(rf_model, X_test, y_test)
             ridge_eval = evaluate_model(ridge_model, X_test, y_test)
             gbm_eval = evaluate_model(gbm_model, X_test, y_test)
+            step_eval = evaluate_model(step_model, X_test, y_test)
 
             # Trading
             y_trade_lr = lr_model.predict(X_trade)
             y_trade_rf = rf_model.predict(X_trade)
             y_trade_ridge = ridge_model.predict(X_trade)
             y_trade_gbm  = gbm_model.predict(X_trade)
+            y_trade_step = step_model.predict(X_trade)
 
 
             # Decide the best model
-            eval_data = [[lr_eval, y_trade_lr], 
-                         [rf_eval, y_trade_rf] ,
+            eval_data = [[lr_eval, y_trade_lr],
+                         [rf_eval, y_trade_rf],
                          [ridge_eval, y_trade_ridge],
-                         [gbm_eval, y_trade_gbm]
-                                ]
+                         [gbm_eval, y_trade_gbm],
+                         [step_eval, y_trade_step]]
             eval_table = pd.DataFrame(eval_data, columns=['model_eval', 'model_predict_return'],
-                                              index=['lr', 'rf','ridge','gbm'])        
+                                    index=['lr', 'rf','ridge','gbm','step'])
 
 
             evaluation_record[unique_datetime[i]]=eval_table
@@ -349,6 +407,7 @@ def run_4model(df,features_column, label_column,date_column,tic_column,
             append_return_table(df_predict_rf, unique_datetime, y_trade_rf, trade_tic, current_index=i)
             append_return_table(df_predict_ridge, unique_datetime, y_trade_ridge, trade_tic, current_index=i)
             append_return_table(df_predict_gbm, unique_datetime, y_trade_gbm, trade_tic, current_index=i)
+            append_return_table(df_predict_step, unique_datetime, y_trade_step, trade_tic, current_index=i)
 
             append_return_table(df_predict_best, unique_datetime, y_trade_best, trade_tic, current_index=i)
 
@@ -364,18 +423,21 @@ def run_4model(df,features_column, label_column,date_column,tic_column,
             df_predict_best,
             df_best_model_name, 
             evaluation_record,
-            df_evaluation)
+            df_evaluation,
+            df_predict_step)
 
 
 def get_model_evaluation_table(evaluation_record,trade_date):
     evaluation_list = []
+    covered_dates = []
     for d in trade_date:
         try:
             evaluation_list.append(evaluation_record[d]['model_eval'].values)
-        except:
+            covered_dates.append(d)
+        except KeyError:
             print('error')
-    df_evaluation = pd.DataFrame(evaluation_list,columns = ['linear_regression', 'random_forest','ridge','gbm'])
-    df_evaluation.index = trade_date
+    df_evaluation = pd.DataFrame(evaluation_list,columns = ['linear_regression', 'random_forest','ridge','gbm','stepwise'])
+    df_evaluation.index = covered_dates
     return df_evaluation
 
 def save_model_result(sector_result,sector_name):
@@ -384,6 +446,7 @@ def save_model_result(sector_result,sector_name):
     df_predict_ridge = sector_result[2].astype(np.float64)
     df_predict_gbm = sector_result[3].astype(np.float64)
     df_predict_best = sector_result[4].astype(np.float64)
+    df_predict_step = sector_result[8].astype(np.float64)
 
     df_best_model_name = sector_result[5]
     df_evaluation_score = sector_result[6]
@@ -404,6 +467,7 @@ def save_model_result(sector_result,sector_name):
     df_predict_rf.to_csv('results/'+sector_name+'/df_predict_rf.csv')
     df_predict_ridge.to_csv('results/'+sector_name+'/df_predict_ridge.csv')
     df_predict_gbm.to_csv('results/'+sector_name+'/df_predict_gbm.csv')
+    df_predict_step.to_csv('results/'+sector_name+'/df_predict_step.csv')
     df_predict_best.to_csv('results/'+sector_name+'/df_predict_best.csv')
     df_best_model_name.to_csv('results/'+sector_name+'/df_best_model_name.csv')
     #df_evaluation_score.to_csv('results/'+sector_name+'/df_evaluation_score.csv')

@@ -1,0 +1,26 @@
+.venv/
+cache/
+.DS_Store
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Local source data and generated outputs. These may contain licensed data,
+# downloaded API responses, large files, or unreproducible local state.
+Data/
+results/
+
+# Local configuration and logs
+.env
+.env.*
+!.env.example
+*.log
+
+# Notebook checkpoints and local profiling artifacts
+.ipynb_checkpoints/
+*.ipynb
+.pytest_cache/
+.mypy_cache/
+
+# Historical/generated figures need a separate copyright and metadata review.
+figs/

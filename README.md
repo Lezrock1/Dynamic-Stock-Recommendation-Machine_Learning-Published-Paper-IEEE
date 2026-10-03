@@ -1,103 +1,139 @@
-# Dynamic-Stock-Recommendation-Machine_Learning
+# Dynamic Stock Recommendation
 
-## First Author: Published paper on IEEE TrustCom 2018 (http://www.cloud-conf.net/trustcom18/)
-Hongyang Yang, Xiao-Yang Liu, Qingwei W. [A Practical Machine Learning Approach for Dynamic Stock Recommendation](https://ssrn.com/abstract=3302088). IEEE TrustCom 2018.
+An extension of the code and method published with [A Practical Machine Learning Approach for Dynamic Stock Recommendation](https://doi.org/10.1109/TrustCom/BigDataSE/ISPA.2018). The original code repository is [AI4Finance-Foundation/Dynamic-Stock-Recommendation-Machine_Learning-Published-Paper-IEEE](https://github.com/AI4Finance-Foundation/Dynamic-Stock-Recommendation-Machine_Learning-Published-Paper-IEEE). This project is not an official release of, or affiliated with, the original authors. The original paper authors are Hongyang Yang, Xiao-Yang Liu, and Qingwei W. [SSRN version](https://ssrn.com/abstract=3302088).
 
-### IEEE Official Link of the paper (https://ieeexplore.ieee.org/abstract/document/8456121)
-### SSRN Version: (https://ssrn.com/abstract=3302088)
+When referring to the research method, cite the original paper:
 
-## Abstract:
-Stock recommendation is vital to investment companies and investors. However, no single stock selection strategy will always win while analysts may not have enough time to check all S&P 500 stocks (the Standard & Poor’s 500). In this paper, we propose a practical scheme that recommends stocks from S&P 500 using machine learning. Our basic idea is to buy and hold the top 20% stocks dynamically. First, we select representative stock indicators with good explanatory power. Secondly, we take five frequently used machine learning methods, including linear regression, ridge regression, stepwise regression, random forest and generalized boosted regression, to model stock indicators and quarterly log-return in a rolling window. Thirdly, we choose the model with the lowest Mean Square Error in each period to rank stocks. Finally, we test the selected stocks by conducting portfolio allocation methods such as equally weighted, mean- variance, and minimum-variance. Our empirical results show that the proposed scheme outperforms the long-only strategy on the S&P 500 index in terms of Sharpe ratio and cumulative returns.
+> Hongyang Yang, Xiao-Yang Liu, and Qingwei W., “A Practical Machine Learning Approach for Dynamic Stock Recommendation,” in *2018 IEEE International Conference on Trust, Security and Privacy in Computing and Communications (TrustCom)*, 2018. [doi:10.1109/TrustCom/BigDataSE/ISPA.2018.00184](https://doi.org/10.1109/TrustCom/BigDataSE/ISPA.2018.00184).
 
-## Index Term:
-Stock recommendation, fundamental value investing, machine learning, model selection, risk management
+When referring to the upstream implementation, also cite and link to the [original GitHub repository](https://github.com/AI4Finance-Foundation/Dynamic-Stock-Recommendation-Machine_Learning-Published-Paper-IEEE). This attribution does not replace the need to verify permission and license terms for code, data, and figures before redistribution.
 
-## Project summary：
-+ We developed a practical approach to using machine-learning methods selecting S&P 500 stocks based on financial ratios (e.g., EPS, ROA, ROE, etc). Outperformed the S&P 500 index on out of sample data, achieved a Sharpe ratio of 0.5 (0.19 on SPX).
-+ We performed feature selection by 11 GICS sectors based on a rolling window to choose the lowest MSE model among Linear Regression, Stepwise Regression, Regression with Ridge, Random Forest, and GBM. Applied a model ensemble method.
+## Purpose and status
 
-<img src=figs/chart10_insample.PNG width="500">
+The project selects S&P 500 stocks each quarter using fundamental indicators. It uses sector-specific models, rolling training windows, and five regression methods:
 
-<img src=figs/chart11_overallPerformance.PNG width="500">
+- Linear regression
+- Ridge regression
+- AIC-based stepwise regression
+- Random forest
+- Gradient boosting
 
-## Data:
-Retrieved from __WRDS (Wharton Research Data Services)__, Compustat Industrial [27 years daily and quarterly Data]
+The models estimate the return for the following quarter. Stocks are then ranked and used for portfolio and backtesting analyses.
 
-<img src=figs/chart1_datasetPeriod.PNG width="500">
+The current code contains the historical WRDS/Compustat workflow and a free-data extension from 2017-09 using SEC Company Facts, Yahoo Finance, and historical S&P 500 membership snapshots. This extension is an auditable approximation, not an exact 1:1 reproduction of the paper: SEC indicators are formula proxies, SEC data is not fully point-in-time, and the original portfolio balance file and parts of the original environment are unavailable.
 
+The results are research and reproduction material, not investment advice or a trading recommendation.
 
-+ __S&P 500 Fundamental Quarterly Data__ ([fundamental_final_table.xlsx](Data/fundamental_final_table.xlsx))
-  + Database: Compustat North America (Fundamentals Quarterly) and (Index Constituents)
-  + Timeline: 27 years (1990-2017)
-  + Tickers: 1193 stock (all historical S&P 500 component stocks)
-  + Value: 20 financial ratios calculated from raw accouting report data
+## Data and external services
 
-+ __S&P 500 Historical Component Stocks Adjusted Daily Price__ ([1-sp500_adj_price.csv.zip](Data/1-sp500_adj_price.csv.zip))
-  + Database: Compustat North America (Security Daily)
-  + Timeline: 27 years (1990-2017)
-  + Tickers: 1193 stock (all historical S&P 500 component stocks)
-  + Value: Adjusted Daily Close Price
+The current local development version uses the following sources:
 
-+ __S&P 500 Index Daily Price__ ([1-spx_price.xlsx](Data/1-spx_price.xlsx))
-  + Database: Yahoo Finance
-  + Timeline: 27 years (1990-2017)
-  + Tickers: SPX
-  + Value: Adjusted Daily Close Price
+- Historical fundamental tables from WRDS/Compustat, 1990-2017. Redistribution and usage rights must be clarified before publication.
+- SEC EDGAR Company Facts for the free-data extension. No API key is required, but SEC requests require a descriptive User-Agent with a contact address.
+- Yahoo Finance through `yfinance` for price data. The terms of use and redistribution rights of retrieved data must be reviewed before publication.
+- Wikipedia for the current S&P 500 constituent list.
+- The public `fja05680/sp500` repository for historical S&P 500 component snapshots. That source documents gaps in its early history.
 
-## Code:
+The upstream repository already tracks historical data files under `Data/` and figures under `figs/`; because this is a fork, those files and their history remain part of the repository. The ignore rules do not untrack inherited files. This extension does not add another copy of those datasets. Newly downloaded caches and generated results are ignored. The code expects historical input files under `Data/1-focasting_data/`; without those files or a future legally suitable alternative, the complete hybrid reproduction cannot run.
 
-### __Focasting Model__:
-+ __Input__: 11 Excel files of cleaned data about fundamental financial ratios (sector 10-Energy, sector 15-Materials, sector 20-Industrials, sector 25-Consumer Discretionary, sector 30-Consumer Staples, sector 35-Health Care, sector 40-Financials, sector 45-Information Technology, sector 50-Telecommunication Services, sector 55-Utilities, sector 60-Real Estate)
-+ __Python Script__: 2 Scripts
-  + [ml_model.py](code/ml_model.py): The forecasting function (cornerstone of this project)
-  + [fundamental_run_model.py](fundamental_run_model.py): The main function to run the forecasting model  
+## Requirements
+
+- Python 3.12 was used for the current development state.
+- Network access to SEC EDGAR, Wikipedia, and Yahoo Finance for dataset construction.
+- Sufficient disk space for local price and SEC caches.
+- Exact package versions are listed in [pipeline/requirements.txt](pipeline/requirements.txt). Other Python versions have not been formally tested.
+
+## Installation
+
 ```shell
-
-python3 fundamental_run_model.py \
-  -sector_name sector10 \
-  -fundamental Data/fundamental_final_table.xlsx \
-  -sector Data/1-focasting_data/sector10_clean.xlsx 
+git clone https://github.com/Lezrock1/Dynamic-Stock-Recommendation-Machine_Learning-Published-Paper-IEEE.git
+cd Dynamic-Stock-Recommendation-Machine_Learning-Published-Paper-IEEE
+python3.12 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r pipeline/requirements.txt
 ```
 
+Set a descriptive User-Agent before fetching SEC or Wikipedia data. The example intentionally contains only a placeholder:
 
-+ __Old R Script__: 3 R Scripts
-  + [fundamental_run_model.R](code/fundamental_run_model.R): The main function to run the forecasting model
-  + [fundamental_ML_model.R](code/fundamental_ML_model.R): The forecasting function (cornerstone of this project)
-  + [fundamental_select_stock.R](code/fundamental_select_stock.R): The function to select top 20% stocks in each sector
-+ __Output__: [a CSV file](Data/2-portfolio_data/stocks_selected_total_user8.csv) includes __tic__: the stock name, __predicted_return__: predicted return of next quarter by our model, __trade_date__: the date to execute the trades
+```shell
+export DYNAMIC_STOCK_USER_AGENT='dynamic-stock-recommendation-research/1.0 (your-email@example.com)'
+```
 
+The [.env.example](.env.example) file can also be used as a reference. It is not loaded automatically, and no API credentials are required.
 
+## Quick start
 
+The complete pipeline downloads data, builds tables, trains the models, and generates reports:
 
+```shell
+python pipeline/run_all.py
+```
 
-### __Portfolio Allocation__:
+The individual steps can be run separately for debugging:
 
-+ __Input__: 2 files
-  + The [CSV file](Data/2-portfolio_data/stocks_selected_total_user8.csv) generated by forecasting model
-  + The [adjusted close price data of S&P 500 stocks](Data/1-sp500_adj_price.csv.zip) to calculate covariance matrix
+```shell
+python pipeline/build_dataset.py
+python pipeline/run_model.py
+python pipeline/report.py
+python pipeline/paper_performance.py
+```
 
-+ __Script__: [fundamental_portfolio.ipynb](fundamental_portfolio.ipynb)
+For example, one sector or only feature coverage can be inspected with:
 
-+ __Output__: 3 Excel files each with the following 4 columns
-  1. __tic__: the stock name
-  2. __predicted_return__: predicted return of next quarter by our model
-  3. __weights__: the weights to trade
-  4. __trade_date__: the date to execute the trades
+```shell
+python pipeline/run_model.py --sector sector45 --features-only
+```
 
+Model fitting is computationally expensive and can take a substantial amount of time depending on the dataset and parallelization. Check that no other training process is running before starting another run.
 
+## Results and project structure
 
-### __Back-testing Model__:
+```text
+pipeline/                  data retrieval, feature construction, models, reports
+code/ml_model.py           model core and result serialization
+Data/                       local input data and generated tables
+cache/                      local API and universe caches
+results/                    local predictions, picks, tables, and figures
+figs/                       historical figures from the original project
+fundamental_*.ipynb         legacy portfolio and backtest notebooks
+```
 
-+ __Input__: 5 files
-  + [equally_weighted](Data/2-portfolio_data/equally_weighted_user8.xlsx): equally-weighted portfolio (Portfolio Benchmark)
-  + [mean_weighted](Data/2-portfolio_data/mean_weighted_user8.xlsx): mean-variance portfolio
-  + [minimum_weighted](Data/2-portfolio_data/minimum_weighted_user8.xlsx): minimum-variance portfolio (our model)
-  + [adjusted daily close price of S&P 500 stocks](Data/1-sp500_adj_price.csv.zip): to calcualte quarterly return
-  + [SPX adjusted daily close price](Data/1-spx_price.xlsx): The Market Index (Overall Benchmark)
+Important local outputs include `results/latest_picks.csv`, sector-specific files under `results/sectorXX/`, and paper comparisons under `results/paper_extension/`. Newly generated outputs and caches are excluded by `.gitignore`. Files already tracked by the upstream repository, including its original data and figures, remain tracked in this fork unless explicitly removed in a commit; ignore rules do not remove them from Git history.
 
-+ __Script__: 1 Python jupyter notebook Script
-  + [fundamental_back_testing.ipynb](code/fundamental_back_testing.ipynb): The back-testing function
+## Survivorship bias and limitations
 
-+ __Output__:
-  1. Quarterly return of our portfolio with transaction cost
-  2. Performance Evaluation: total return, annulized return and standard deviation, maximum drawdown, Sharpe ratio
+According to the original documentation, the historical WRDS workflow contains 1,193 historical S&P 500 component stocks. For the free-data extension, membership is checked quarterly using dated snapshots, and some former constituents are added through SEC CIK mappings and historical GICS assignments. This reduces survivorship bias but does not eliminate it: early snapshots are incomplete, some delisted companies have no usable free prices or fundamentals, and SEC restatements are not historical point-in-time data.
+
+Other known limitations:
+
+- SEC ratios are approximations of the original Compustat formulas.
+- Not all 20 indicators are available or trainable in every sector; `feature_manifest.csv` documents the selection.
+- The original R and portfolio implementations, the exact original backtest balance matrix, and parts of the original data are unavailable.
+- The model validation and portfolio assumptions have not been audited as an investment product.
+
+## Planned extensions
+
+A planned research step is to add the STOXX Europe 600. The same workflow should then run over a combined nominal universe of up to 1,100 index constituents (S&P 500 plus STOXX Europe 600). Overlapping companies must be deduplicated, and historical membership, currencies, trading calendars, sector classifications, delistings, missing data, and transaction costs must be handled consistently. Comparable fundamental data for both regions is also required before evaluating a combined model.
+
+## Tests and verification
+
+The pipeline currently has no complete automated test suite. A minimal Python syntax check is:
+
+```shell
+python -m py_compile code/ml_model.py fundamental_run_model.py pipeline/*.py
+```
+
+After a run, inspect the generated tables and feature manifests for quarterly coverage, missing values, and data-source provenance. Results can change when upstream data is revised.
+
+## License and rights
+
+This repository currently has no selected open-source license. The upstream GitHub repository does not expose a `LICENSE` file (checked 2026-10-03). GitHub's [Terms of Service, section D.5](https://docs.github.com/en/site-policy/github-terms/github-terms-of-service#5-license-grant-to-other-users) grant users a limited right to view and reproduce public repository content by forking it through GitHub. This platform-specific fork permission is not a general-purpose open-source license for redistribution outside GitHub. GitHub's [licensing guidance](https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/licensing-a-repository) explains that, without a license, default copyright rules otherwise apply. Rights to third-party material such as WRDS/Compustat data and figures must still be checked before including them in a public fork.
+
+Before publication, also review rights for WRDS/Compustat data, Yahoo Finance data, paper figures, and historical membership data. Yahoo's [Terms of Service](https://legal.yahoo.com/us/en/yahoo/terms/otos/index.html) restrict automated collection and reuse absent permission; SEC EDGAR's [fair-access guidance](https://www.sec.gov/os/accessing-edgar-data) requires a descriptive User-Agent and reasonable request rates. These service terms do not themselves grant redistribution rights to downloaded data.
+
+A license for original code can only be selected after those rights are clarified. No license is added here deliberately, and a license must not purport to grant rights to third-party material. The paper authors and data sources should be credited appropriately; this is not a substitute for legal advice.
+
+## Publication status
+
+This repository is a GitHub fork of the upstream project. Updates should be added as commits on this fork so the upstream relationship and original history remain intact. The fork inherits the upstream's files and history; a new commit must not add local datasets, caches, generated results, notebook outputs, or personal paths. Review the rights for inherited WRDS/Compustat data and figures before reusing them outside GitHub or redistributing them separately.

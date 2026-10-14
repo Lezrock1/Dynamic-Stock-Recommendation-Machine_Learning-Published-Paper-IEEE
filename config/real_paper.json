@@ -1,0 +1,127 @@
+{
+  "environment": "real",
+  "database": "state/real_paper.sqlite3",
+  "backup_dir": "state/backups",
+  "manifest_dir": "state/expected_filings",
+  "initial_capital": 1000000.0,
+  "benchmark": {
+    "symbol": "SPY",
+    "description": "SPDR S&P 500 ETF adjusted close (distributions reinvested); proxy for the S&P 500 total-return index, not the index itself",
+    "label": "SPY-Vergleich",
+    "currency": "USD",
+    "valuation_rule": "portfolio: raw (split-adjusted, not dividend-adjusted) close + dividend receivable from ex-date + cash on documented pay date; SPY: dividend-adjusted close (distributions reinvested). Same start session, same currency (USD). Never mix adjusted prices with separate dividend credits for the same asset.",
+    "pay_date_source": "Nasdaq dividend calendar (api.nasdaq.com/api/calendar/dividends?date=<ex-date>), amount cross-checked against yfinance; unknown pay date => no receivable and no cash, retried for 45 days"
+  },
+  "universe": {
+    "source": "universe.get_sp500_universe: current S&P 500 constituents (Wikipedia list with SEC CIKs)",
+    "exclusions": {},
+    "as_of_policy": "universe_as_of = quarter end of the cycle (fixed in the manifest at first generation)",
+    "period_overrides": {
+      "2089271": {
+        "quarter_end": "2026-09-30",
+        "period_end": "2026-09-26",
+        "form": "10-Q",
+        "source": "https://investor.honeywellaerospace.com/static-files/b47ba5fe-f963-4719-9acb-893d51f2c65d",
+        "source_note": "company release of 2026-08-05 naming this upcoming 10-Q; supplied by the user, page returned HTTP 403 to the automated fetch and was not verified by the tool",
+        "status_rule": "ready only when the actual 10-Q and required XBRL facts are available"
+      }
+    },
+    "cik_successors": {
+      "2115436": {
+        "predecessors": [
+          34088
+        ],
+        "effective": "2026-07-01",
+        "source": "SEC Form 8-K12B accession 0001193125-26-291990 (ExxonMobil Holdings Corp, filed 2026-07-01)"
+      }
+    }
+  },
+  "model": {
+    "first_trade_date_index": 21,
+    "testing_windows": 4,
+    "max_rolling_window_index": 45,
+    "selection_quantile": 0.8,
+    "min_feature_coverage": 0.5
+  },
+  "dividend_cash_policy": "receivable_on_ex_date_cash_on_pay_date",
+  "report_matching_tolerance_days": 10,
+  "ixbrl_fallback": {
+    "enabled": true,
+    "rule_version": "ixbrl-fallback-v1",
+    "recent_filings": 2,
+    "ciks": [40533, 922621, 1701605, 1067983, 1176948, 1841666, 2041610, 2082247],
+    "traded_class_member": {
+      "922621": "us-gaap:CommonClassAMember",
+      "1701605": "us-gaap:CommonClassAMember",
+      "1067983": "brka:EquivalentClassBMember"
+    },
+    "note": "Fills only periods missing in SEC companyfacts, from the original filing's primary iXBRL document. Per-share facts use the share class of the traded ticker (ERIE Class A, BKR Class A, BRK-B equivalent Class B); other classes are never merged. Revenue/COGS with differing candidate values stay missing."
+  },
+  "required_facts": [
+    "Revenue",
+    "NetIncome",
+    "Assets",
+    "StockholdersEquity"
+  ],
+  "readiness_rule": {
+    "version": "3",
+    "supersedes": "2 (special cases were reported but never satisfied the gate)",
+    "changed_on": "2026-10-14",
+    "reason": "Total revenue is not a uniform XBRL concept for banks/insurers (verified: FITB, RF, TFC, SYF file no total-revenue tag). Gate for GICS sector 40 does not require Revenue; Visa (CIK 1403161) files Revenue and keeps the full default set. The 100 % expected-report completeness is unchanged.",
+    "required_facts_by_gsector": {
+      "40": [
+        "NetIncome",
+        "Assets",
+        "StockholdersEquity"
+      ]
+    },
+    "required_facts_by_cik": {
+      "1403161": [
+        "Revenue",
+        "NetIncome",
+        "Assets",
+        "StockholdersEquity"
+      ]
+    },
+    "corporate_action_resolutions": {
+      "1437107": {
+        "ticker": "WBD",
+        "status": "CORPORATE_ACTION_RESOLVED",
+        "event": "acquired by Paramount Skydance; trading ended, delisted",
+        "evidence": [
+          {
+            "type": "SEC Form 25 (removal from listing)",
+            "accession": "0001193125-26-415091",
+            "filed": "2026-10-06",
+            "url": "https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK=1437107&type=25"
+          },
+          {
+            "type": "SEC Form 8-K items 2.01, 3.01 (completion, delisting notice)",
+            "accession": "0001193125-26-415055",
+            "filed": "2026-10-06"
+          }
+        ],
+        "applies_to_filing_keys": [
+          "1437107-2026-09-30-10-Q"
+        ],
+        "buy_candidate": false,
+        "counts_as_ready": false,
+        "satisfies_gate": true,
+        "final_trading_end": "2026-10-05",
+        "final_trading_end_evidence": "last session in cache/prices/WBD.csv is 2026-10-05; SEC Form 25 filed 2026-10-06"
+      }
+    },
+    "resolution_policy": "A CORPORATE_ACTION_RESOLVED entry needs a primary-source evidence URL and a date; it is never READY, never a buy candidate, and is reported separately. Timeouts, missing facts or ordinary index exits never create one.",
+    "reason_v3": "An evidenced CORPORATE_ACTION_RESOLVED case (final end of trading documented by Form 25 and the last cached session) satisfies the gate for that one filing key. It is never READY and never a buy candidate; the original expectation list is unchanged and 100 % of it must be READY or evidenced. Ordinary data gaps, timeouts and index exits never qualify.",
+    "buy_blocks": {
+      "1755672": {
+        "ticker": "CTVA",
+        "status": "BUY_BLOCK_UNRESOLVED_CORPORATE_ACTION",
+        "event": "separation of Corteva's seed/crop-protection entity; VYLR started trading 2026-10-01 (68.26)",
+        "reason": "raw prices show no jump on 2026-10-01 (11.65 -> 12.57) and the economic scope of the fundamentals used is not shown to be comparable pre/post separation",
+        "stays_in_expectation": true,
+        "release_condition": "documented comparability of price series and fundamental scope (SEC filings/adjustment factors); not released automatically by the next 10-Q"
+      }
+    }
+  }
+}

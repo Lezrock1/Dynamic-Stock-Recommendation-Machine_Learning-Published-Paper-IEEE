@@ -1,0 +1,14 @@
+{
+  "type": "spy_total_return_proxy",
+  "source": "REPLACE_WITH_DOCUMENTED_DATA_PROVIDER",
+  "index_identity": "SPDR S&P 500 ETF Trust (SPY), total return with reinvested cash distributions",
+  "currency": "USD",
+  "dividend_treatment": "cash_distributions_reinvested_total_return",
+  "fund_expenses_embedded": true,
+  "start_date": "YYYY-MM-DD",
+  "end_date": "YYYY-MM-DD",
+  "retrieved_at": "YYYY-MM-DDTHH:MM:SSZ",
+  "verified": false,
+  "verification_method": "REPLACE_WITH_REPRODUCIBLE_SOURCE_CHECK",
+  "evidence_uri": "REPLACE_WITH_PROVIDER_DOCUMENTATION_OR_LICENSED_SOURCE_RECORD"
+}

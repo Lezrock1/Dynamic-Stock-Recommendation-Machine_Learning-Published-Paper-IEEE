@@ -8,6 +8,10 @@ from sklearn.svm import SVR
 from sklearn.metrics import confusion_matrix
 from sklearn.model_selection import cross_val_score, cross_val_predict
 from sklearn.linear_model import Ridge
+from sklearn.impute import SimpleImputer
+from sklearn.pipeline import Pipeline
+from sklearn.base import BaseEstimator, RegressorMixin
+from sklearn.preprocessing import StandardScaler
 
 from sklearn.linear_model import LinearRegression
 from sklearn.feature_selection import RFE
@@ -18,93 +22,213 @@ from sklearn.ensemble import AdaBoostRegressor
 
 from sklearn.model_selection import TimeSeriesSplit, GridSearchCV,RandomizedSearchCV
 
-from keras.models import Sequential
-from keras.layers import Dense
-from keras.layers import LSTM
-from keras.layers import Dropout
-
 import os
 import errno
 
+MAX_SEARCH_JOBS = min(4, os.cpu_count() or 1)
 
-def prepare_rolling_train(df,features_column,label_column,date_column,unique_datetime,testing_windows,first_trade_date_index, max_rolling_window_index,current_index):
+
+def quarter_group_splits(quarter_dates, n_splits=3):
+    """Expanding CV by complete quarters, purging the label horizon at each fold."""
+    dates = pd.to_datetime(pd.Series(quarter_dates)).reset_index(drop=True)
+    if dates.isna().any():
+        raise ValueError("quarter dates for model selection must be present")
+    unique_dates = np.array(sorted(dates.unique()))
+    if len(unique_dates) < n_splits + 2:
+        raise ValueError(
+            f"quarter-aware CV needs at least {n_splits + 2} unique quarters; got {len(unique_dates)}"
+        )
+    splits = []
+    for train_groups_i, validation_groups_i in TimeSeriesSplit(n_splits=n_splits).split(unique_dates):
+        train_groups = unique_dates[train_groups_i]
+        validation_groups = unique_dates[validation_groups_i]
+        # A label for the last training quarter matures on the first validation
+        # execution date, after that date's signal cutoff.
+        train_groups = train_groups[:-1]
+        train_i = np.flatnonzero(dates.isin(train_groups).to_numpy())
+        validation_i = np.flatnonzero(dates.isin(validation_groups).to_numpy())
+        if not len(train_i) or not len(validation_i):
+            raise ValueError("quarter-aware CV produced an empty fold after label purging")
+        splits.append((train_i, validation_i))
+    return splits
+
+
+def prepare_rolling_train(df,features_column,label_column,date_column,unique_datetime,testing_windows,first_trade_date_index, max_rolling_window_index,current_index,as_of=None):
+    train_end_index = current_index - testing_windows - 1
     if current_index <=max_rolling_window_index:
         train=df[(df[date_column] >= unique_datetime[0]) \
-                & (df[date_column] < unique_datetime[current_index-testing_windows])]
+                & (df[date_column] < unique_datetime[train_end_index])]
     else:
         train=df[(df[date_column] >= unique_datetime[current_index-max_rolling_window_index]) \
-                & (df[date_column] < unique_datetime[current_index-testing_windows])]
+                & (df[date_column] < unique_datetime[train_end_index])]
         
     X_train=train[features_column]
     y_train=train[label_column]
+    known = y_train.notna()
+    if "label_known_at" not in train.columns:
+        known &= False
+    else:
+        if as_of is None:
+            raise ValueError("as_of is required when training rows carry label_known_at")
+        label_times = pd.to_datetime(train["label_known_at"], utc=True, errors="coerce")
+        known &= label_times.notna() & (label_times <= pd.to_datetime(as_of, utc=True))
+    X_train = X_train.loc[known]
+    y_train = y_train.loc[known]
     return X_train,y_train
 
-def prepare_rolling_test(df,features_column,label_column,date_column,unique_datetime,testing_windows,fist_trade_date_index, current_index):
-    test=df[(df[date_column] >= unique_datetime[current_index-testing_windows]) \
-            & (df[date_column] < unique_datetime[current_index])]
+def prepare_rolling_test(df,features_column,label_column,date_column,unique_datetime,testing_windows,fist_trade_date_index, current_index,as_of=None):
+    test=df[(df[date_column] >= unique_datetime[current_index-testing_windows-1]) \
+            & (df[date_column] < unique_datetime[current_index-1])]
     X_test=test[features_column]
     y_test=test[label_column]
+    known = y_test.notna()
+    if "label_known_at" not in test.columns:
+        known &= False
+    else:
+        if as_of is None:
+            raise ValueError("as_of is required when validation rows carry label_known_at")
+        label_times = pd.to_datetime(test["label_known_at"], utc=True, errors="coerce")
+        known &= label_times.notna() & (label_times <= pd.to_datetime(as_of, utc=True))
+    X_test = X_test.loc[known]
+    y_test = y_test.loc[known]
     return X_test,y_test
 
 def prepare_trade_data(df,features_column,label_column,date_column,tic_column,unique_datetime,testing_windows,fist_trade_date_index, current_index):
     trade  = df[df[date_column] == unique_datetime[current_index]]
+    trade = trade.drop_duplicates(subset=[tic_column], keep='last')
     X_trade = trade[features_column]
     y_trade = trade[label_column]
     trade_tic = trade[tic_column].values
     return X_trade,y_trade,trade_tic
 
 
-def train_linear_regression(X_train,y_train):
-
-    lr_regressor = LinearRegression()
+def train_linear_regression(X_train,y_train,quarter_dates=None):
+    lr_regressor = Pipeline([
+        ("imputer", SimpleImputer(strategy="median", keep_empty_features=True)),
+        ("model", LinearRegression()),
+    ])
     model = lr_regressor.fit(X_train, y_train)
     
     return model
 
-def train_recursive_feature_elimination(X_train,y_train):
+
+class StepwiseAICRegressor(RegressorMixin, BaseEstimator):
+    def fit(self, X, y):
+        self.feature_names_ = list(X.columns) if hasattr(X, "columns") else [
+            f"x{i}" for i in range(np.asarray(X).shape[1])
+        ]
+        matrix = np.asarray(X, dtype=float)
+        target = np.asarray(y, dtype=float)
+        sample_count, feature_count = matrix.shape
+        selected = []
+
+        def aic(indices):
+            design = np.column_stack([np.ones(sample_count), matrix[:, indices]])
+            coefficients = np.linalg.lstsq(design, target, rcond=None)[0]
+            residuals = target - design @ coefficients
+            rss = max(float(residuals @ residuals), np.finfo(float).tiny)
+            return sample_count * np.log(rss / sample_count) + 2 * design.shape[1]
+
+        current_aic = aic(selected)
+        while len(selected) < feature_count:
+            candidates = [i for i in range(feature_count) if i not in selected]
+            if not candidates:
+                break
+            candidate_aics = [(aic(selected + [i]), i) for i in candidates]
+            candidate_aic, candidate = min(candidate_aics)
+            if candidate_aic >= current_aic:
+                break
+            selected.append(candidate)
+            current_aic = candidate_aic
+
+            while selected:
+                removal_aics = [(aic([i for i in selected if i != removed]), removed) for removed in selected]
+                removal_aic, removed = min(removal_aics)
+                if removal_aic >= current_aic:
+                    break
+                selected.remove(removed)
+                current_aic = removal_aic
+
+        self.selected_features_ = [self.feature_names_[i] for i in selected]
+        self.selected_indices_ = selected
+        if self.selected_features_:
+            self.model_ = LinearRegression().fit(matrix[:, self.selected_indices_], y)
+        else:
+            self.model_ = None
+            self.mean_ = float(np.mean(target))
+        return self
+
+    def predict(self, X):
+        if self.model_ is None:
+            return np.full(len(X), self.mean_)
+        return self.model_.predict(np.asarray(X, dtype=float)[:, self.selected_indices_])
+
+def train_stepwise_regression(X_train, y_train,quarter_dates=None):
+    return Pipeline([
+        ("imputer", SimpleImputer(strategy="median", keep_empty_features=True)),
+        ("model", StepwiseAICRegressor()),
+    ]).fit(X_train, y_train)
+
+def train_recursive_feature_elimination(X_train,y_train,quarter_dates=None):
 
     lr_regressor = LinearRegression(random_state = 42)
     model = RFE(lr_regressor)
     
     return model
 
-def train_lasso(X_train, y_train):
+def train_lasso(X_train, y_train,quarter_dates=None):
     # lasso_regressor = Lasso()
     # model = lasso_regressor.fit(X_train, y_train)
 
-    lasso = Lasso(random_state = 42)
+    lasso = Pipeline([
+        ("imputer", SimpleImputer(strategy="median", keep_empty_features=True)),
+        ("scale", StandardScaler()),
+        ("model", Lasso(random_state=42)),
+    ])
     # scoring_method = 'r2'
     # scoring_method = 'explained_variance'
     # scoring_method = 'neg_mean_absolute_error'
     scoring_method = 'neg_mean_squared_error'
     #scoring_method = 'neg_mean_squared_log_error'
-    parameters = {'alpha': [1e-15, 1e-10, 1e-8, 1e-4, 1e-3, 1e-2, 1, 5, 10, 20]}
+    parameters = {'model__alpha': [1e-15, 1e-10, 1e-8, 1e-4, 1e-3, 1e-2, 1, 5, 10, 20]}
     # my_cv_lasso = TimeSeriesSplit(n_splits=3).split(X_train_advanced)
-    lasso_regressor = GridSearchCV(lasso, parameters, scoring=scoring_method, cv=3)
+    if quarter_dates is None:
+        raise ValueError("quarter_dates are required for time-ordered model selection")
+    lasso_regressor = GridSearchCV(
+        lasso, parameters, scoring=scoring_method, cv=quarter_group_splits(quarter_dates)
+    )
     lasso_regressor.fit(X_train, y_train)
 
     model = lasso_regressor.best_estimator_
     return model
 
-def train_ridge(X_train, y_train):
+def train_ridge(X_train, y_train,quarter_dates=None):
     # lasso_regressor = Lasso()
     # model = lasso_regressor.fit(X_train, y_train)
 
-    ridge = Ridge(random_state = 42)
+    ridge = Pipeline([
+        ("imputer", SimpleImputer(strategy="median", keep_empty_features=True)),
+        ("scale", StandardScaler()),
+        ("model", Ridge(random_state=42)),
+    ])
     # scoring_method = 'r2'
     # scoring_method = 'explained_variance'
     # scoring_method = 'neg_mean_absolute_error'
     scoring_method = 'neg_mean_squared_error'
     #scoring_method = 'neg_mean_squared_log_error'
-    parameters = {'alpha': [1e-15, 1e-10, 1e-8, 1e-4, 1e-3, 1e-2, 1, 5, 10, 20]}
+    parameters = {'model__alpha': [1e-15, 1e-10, 1e-8, 1e-4, 1e-3, 1e-2, 1, 5, 10, 20]}
     # my_cv_lasso = TimeSeriesSplit(n_splits=3).split(X_train_advanced)
-    ridge_regressor = GridSearchCV(ridge, parameters, scoring=scoring_method, cv=3)
+    if quarter_dates is None:
+        raise ValueError("quarter_dates are required for time-ordered model selection")
+    ridge_regressor = GridSearchCV(
+        ridge, parameters, scoring=scoring_method, cv=quarter_group_splits(quarter_dates)
+    )
     ridge_regressor.fit(X_train, y_train)
 
     model = ridge_regressor.best_estimator_
     return model
 
-def train_random_forest(X_train, y_train):
+def train_random_forest(X_train, y_train,quarter_dates=None):
     
     random_grid = {
                    #'max_depth': [10, 20, 40, 80, 100, None],
@@ -119,7 +243,10 @@ def train_random_forest(X_train, y_train):
     #scoring_method = 'neg_mean_squared_log_error'
 
     # my_cv_rf = TimeSeriesSplit(n_splits=5).split(X_train_rf)
-    rf = RandomForestRegressor(random_state=42)
+    rf = Pipeline([
+        ("imputer", SimpleImputer(strategy="median", keep_empty_features=True)),
+        ("model", RandomForestRegressor(random_state=42)),
+    ])
     #RandomizedSearchCV
     #randomforest_regressor = RandomizedSearchCV(estimator=rf, 
     #                                            param_distributions=random_grid,
@@ -129,10 +256,12 @@ def train_random_forest(X_train, y_train):
     #                                            scoring=scoring_method, 
     #                                            verbose=0)
     #GridSearchCV
+    if quarter_dates is None:
+        raise ValueError("quarter_dates are required for time-ordered model selection")
     randomforest_regressor = GridSearchCV(estimator=rf, 
-                                          param_grid=random_grid,
-                                          cv=3, 
-                                          n_jobs=-1, 
+                                          param_grid={f"model__{name}": values for name, values in random_grid.items()},
+                                          cv=quarter_group_splits(quarter_dates), 
+                                          n_jobs=MAX_SEARCH_JOBS, 
                                           scoring=scoring_method, 
                                           verbose=0)  
     
@@ -148,10 +277,14 @@ def train_random_forest(X_train, y_train):
     return model
 
 
-def train_svm(X_train, y_train):
-    svr = SVR(kernel = 'rbf')
+def train_svm(X_train, y_train,quarter_dates=None):
+    svr = Pipeline([
+        ("imputer", SimpleImputer(strategy="median", keep_empty_features=True)),
+        ("scale", StandardScaler()),
+        ("model", SVR(kernel="rbf")),
+    ])
 
-    param_grid_svm = {'C':[0.001, 0.1, 1],'gamma': [1e-7,0.1]}
+    param_grid_svm = {'model__C':[0.001, 0.1, 1],'model__gamma': [1e-7,0.1]}
     #param_grid_svm = {'kernel': ('linear', 'rbf','poly'), 'C':[0.001, 0.01, 0.1, 1, 10],'gamma': [1e-7, 1e-4,0.001,0.1],'epsilon':[0.1,0.2,0.5,0.3]}
 
     # scoring_method = 'r2'
@@ -160,7 +293,11 @@ def train_svm(X_train, y_train):
     scoring_method = 'neg_mean_squared_error'
     #scoring_method = 'neg_mean_squared_log_error'
     
-    svm_regressor = GridSearchCV(estimator=svr, param_grid =param_grid_svm, cv=3, n_jobs=-1, scoring=scoring_method, verbose=0)
+    if quarter_dates is None:
+        raise ValueError("quarter_dates are required for time-ordered model selection")
+    svm_regressor = GridSearchCV(estimator=svr, param_grid =param_grid_svm,
+                                 cv=quarter_group_splits(quarter_dates),
+                                 n_jobs=MAX_SEARCH_JOBS, scoring=scoring_method, verbose=0)
     
     svm_regressor.fit(X_train, y_train)
     model = svm_regressor.best_estimator_
@@ -171,18 +308,25 @@ def train_svm(X_train, y_train):
     return model
 
 
-def train_gbm(X_train, y_train):
-    gbm = GradientBoostingRegressor(random_state = 42)
+def train_gbm(X_train, y_train,quarter_dates=None):
+    gbm = Pipeline([
+        ("imputer", SimpleImputer(strategy="median", keep_empty_features=True)),
+        ("model", GradientBoostingRegressor(random_state=42)),
+    ])
     # model = gbm.fit(X_train, y_train)
 
-    param_grid_gbm = {'learning_rate': [0.1,  0.01, 0.001], 'n_estimators': [100, 250, 500,1000]}
+    param_grid_gbm = {'model__learning_rate': [0.1,  0.01, 0.001],
+                      'model__n_estimators': [100, 250, 500,1000]}
     # scoring_method = 'r2'
     # scoring_method = 'explained_variance'
     # scoring_method = 'neg_mean_absolute_error'
     scoring_method = 'neg_mean_squared_error'
     #scoring_method = 'neg_mean_squared_log_error'
+    if quarter_dates is None:
+        raise ValueError("quarter_dates are required for time-ordered model selection")
     gbm_regressor = GridSearchCV(estimator=gbm, param_grid=param_grid_gbm,
-                                       cv=3, n_jobs=-1, scoring=scoring_method, verbose=0)
+                                 cv=quarter_group_splits(quarter_dates),
+                                 n_jobs=MAX_SEARCH_JOBS, scoring=scoring_method, verbose=0)
 
     gbm_regressor.fit(X_train, y_train)
     model = gbm_regressor.best_estimator_
@@ -210,7 +354,7 @@ def train_ada(X_train, y_train):
     #scoring_method = 'neg_mean_squared_log_error'
 
     ada_regressor = GridSearchCV(estimator=ada, param_distributions=param_grid_ada,
-                                       cv=3, n_jobs=-1, scoring=scoring_method, verbose=0)
+                                       cv=3, n_jobs=MAX_SEARCH_JOBS, scoring=scoring_method, verbose=0)
 
     ada_regressor.fit(X_train, y_train)
     model = ada_regressor.best_estimator_
@@ -243,22 +387,24 @@ def evaluate_model(model, X_test, y_test):
 
 
 def append_return_table(df_predict, unique_datetime, y_trade_return, trade_tic, current_index):
-    tmp_table = pd.DataFrame(columns=trade_tic)
-    tmp_table = tmp_table.append(pd.Series(y_trade_return, index=trade_tic), ignore_index=True)
-    df_predict.loc[unique_datetime[current_index]][tmp_table.columns] = tmp_table.loc[0]
+    row = pd.Series(y_trade_return, index=trade_tic)
+    row = row.groupby(level=0, sort=False).last()
+    df_predict.loc[unique_datetime[current_index], row.index] = row.values
 
 
 def run_4model(df,features_column, label_column,date_column,tic_column,
               unique_ticker, unique_datetime, trade_date, 
-              first_trade_date_index=20,
+              first_trade_date_index=21,
               testing_windows=4,
-              max_rolling_window_index=44):
+              max_rolling_window_index=45,
+              trade_start_date=None):
     ## initialize all the result tables
     ## need date as index and unique tic name as columns
     df_predict_lr = pd.DataFrame(columns=unique_ticker, index=trade_date)
     df_predict_rf = pd.DataFrame(columns=unique_ticker, index=trade_date)
     df_predict_ridge = pd.DataFrame(columns=unique_ticker, index=trade_date)
     df_predict_gbm = pd.DataFrame(columns=unique_ticker, index=trade_date)
+    df_predict_step = pd.DataFrame(columns=unique_ticker, index=trade_date)
 
     df_predict_best = pd.DataFrame(columns=unique_ticker, index=trade_date)
     df_best_model_name = pd.DataFrame(columns=['model_name'], index=trade_date)
@@ -268,7 +414,14 @@ def run_4model(df,features_column, label_column,date_column,tic_column,
     # testing_windows = 6
 
     for i in range(first_trade_date_index, len(unique_datetime)):
+        if trade_start_date is not None and unique_datetime[i] < trade_start_date:
+            continue
         try:
+            trade_rows = df[df[date_column] == unique_datetime[i]]
+            if "signal_time" in trade_rows.columns and not trade_rows.empty:
+                signal_as_of = trade_rows["signal_time"].iloc[0]
+            else:
+                raise ValueError("point-in-time signal_time is required to fit and validate this cycle")
             # prepare training data
             X_train, y_train = prepare_rolling_train(df, 
                                                      features_column,
@@ -278,7 +431,8 @@ def run_4model(df,features_column, label_column,date_column,tic_column,
                                                      testing_windows, 
                                                      first_trade_date_index, 
                                                      max_rolling_window_index,
-                                                     current_index=i
+                                                     current_index=i,
+                                                     as_of=signal_as_of
                                                      )
 
             # prepare testing data
@@ -289,7 +443,8 @@ def run_4model(df,features_column, label_column,date_column,tic_column,
                                                   unique_datetime, 
                                                   testing_windows, 
                                                   first_trade_date_index,
-                                                  current_index=i)
+                                                  current_index=i,
+                                                  as_of=signal_as_of)
 
             # prepare trade data
             X_trade, y_trade, trade_tic = prepare_trade_data(df,
@@ -303,10 +458,16 @@ def run_4model(df,features_column, label_column,date_column,tic_column,
                                                              current_index=i)
 
             # Training
+            if X_train.empty or X_test.empty:
+                raise ValueError(
+                    f"cycle {unique_datetime[i]} lacks training labels or four completed validation quarters"
+                )
+            train_quarters = df.loc[X_train.index, date_column]
             lr_model = train_linear_regression(X_train, y_train)
-            rf_model = train_random_forest(X_train, y_train)
-            ridge_model = train_ridge(X_train, y_train)
-            gbm_model = train_gbm(X_train, y_train)
+            rf_model = train_random_forest(X_train, y_train, quarter_dates=train_quarters)
+            ridge_model = train_ridge(X_train, y_train, quarter_dates=train_quarters)
+            gbm_model = train_gbm(X_train, y_train, quarter_dates=train_quarters)
+            step_model = train_stepwise_regression(X_train, y_train)
 
 
             # Validation
@@ -314,22 +475,24 @@ def run_4model(df,features_column, label_column,date_column,tic_column,
             rf_eval = evaluate_model(rf_model, X_test, y_test)
             ridge_eval = evaluate_model(ridge_model, X_test, y_test)
             gbm_eval = evaluate_model(gbm_model, X_test, y_test)
+            step_eval = evaluate_model(step_model, X_test, y_test)
 
             # Trading
             y_trade_lr = lr_model.predict(X_trade)
             y_trade_rf = rf_model.predict(X_trade)
             y_trade_ridge = ridge_model.predict(X_trade)
             y_trade_gbm  = gbm_model.predict(X_trade)
+            y_trade_step = step_model.predict(X_trade)
 
 
             # Decide the best model
-            eval_data = [[lr_eval, y_trade_lr], 
-                         [rf_eval, y_trade_rf] ,
+            eval_data = [[lr_eval, y_trade_lr],
+                         [rf_eval, y_trade_rf],
                          [ridge_eval, y_trade_ridge],
-                         [gbm_eval, y_trade_gbm]
-                                ]
+                         [gbm_eval, y_trade_gbm],
+                         [step_eval, y_trade_step]]
             eval_table = pd.DataFrame(eval_data, columns=['model_eval', 'model_predict_return'],
-                                              index=['lr', 'rf','ridge','gbm'])        
+                                    index=['lr', 'rf','ridge','gbm','step'])
 
 
             evaluation_record[unique_datetime[i]]=eval_table
@@ -349,6 +512,7 @@ def run_4model(df,features_column, label_column,date_column,tic_column,
             append_return_table(df_predict_rf, unique_datetime, y_trade_rf, trade_tic, current_index=i)
             append_return_table(df_predict_ridge, unique_datetime, y_trade_ridge, trade_tic, current_index=i)
             append_return_table(df_predict_gbm, unique_datetime, y_trade_gbm, trade_tic, current_index=i)
+            append_return_table(df_predict_step, unique_datetime, y_trade_step, trade_tic, current_index=i)
 
             append_return_table(df_predict_best, unique_datetime, y_trade_best, trade_tic, current_index=i)
 
@@ -356,6 +520,7 @@ def run_4model(df,features_column, label_column,date_column,tic_column,
 
         except Exception:
             traceback.print_exc()
+            raise
     df_evaluation = get_model_evaluation_table(evaluation_record,trade_date)
     return (df_predict_lr, 
             df_predict_rf, 
@@ -364,18 +529,21 @@ def run_4model(df,features_column, label_column,date_column,tic_column,
             df_predict_best,
             df_best_model_name, 
             evaluation_record,
-            df_evaluation)
+            df_evaluation,
+            df_predict_step)
 
 
 def get_model_evaluation_table(evaluation_record,trade_date):
     evaluation_list = []
+    covered_dates = []
     for d in trade_date:
         try:
             evaluation_list.append(evaluation_record[d]['model_eval'].values)
-        except:
+            covered_dates.append(d)
+        except KeyError:
             print('error')
-    df_evaluation = pd.DataFrame(evaluation_list,columns = ['linear_regression', 'random_forest','ridge','gbm'])
-    df_evaluation.index = trade_date
+    df_evaluation = pd.DataFrame(evaluation_list,columns = ['linear_regression', 'random_forest','ridge','gbm','stepwise'])
+    df_evaluation.index = covered_dates
     return df_evaluation
 
 def save_model_result(sector_result,sector_name):
@@ -384,6 +552,7 @@ def save_model_result(sector_result,sector_name):
     df_predict_ridge = sector_result[2].astype(np.float64)
     df_predict_gbm = sector_result[3].astype(np.float64)
     df_predict_best = sector_result[4].astype(np.float64)
+    df_predict_step = sector_result[8].astype(np.float64)
 
     df_best_model_name = sector_result[5]
     df_evaluation_score = sector_result[6]
@@ -404,6 +573,7 @@ def save_model_result(sector_result,sector_name):
     df_predict_rf.to_csv('results/'+sector_name+'/df_predict_rf.csv')
     df_predict_ridge.to_csv('results/'+sector_name+'/df_predict_ridge.csv')
     df_predict_gbm.to_csv('results/'+sector_name+'/df_predict_gbm.csv')
+    df_predict_step.to_csv('results/'+sector_name+'/df_predict_step.csv')
     df_predict_best.to_csv('results/'+sector_name+'/df_predict_best.csv')
     df_best_model_name.to_csv('results/'+sector_name+'/df_best_model_name.csv')
     #df_evaluation_score.to_csv('results/'+sector_name+'/df_evaluation_score.csv')
@@ -596,11 +766,6 @@ def plot_predict_return_distribution(df_predict_best,sector_name,out_path):
 
         plt.title(sector_name+": trade date - "+str(df_predict_best.index[i]),size=15)
     plt.savefig(out_path+str(df_predict_best.index[i])+".png")
-
-
-
-
-
 
 
 

@@ -1,0 +1,13 @@
+{
+  "type": "sp500_gross_total_return",
+  "source": "REPLACE_WITH_DOCUMENTED_DATA_PROVIDER",
+  "index_identity": "S&P 500 Gross Total Return Index",
+  "currency": "USD",
+  "dividend_treatment": "gross_dividends_reinvested_before_withholding",
+  "start_date": "YYYY-MM-DD",
+  "end_date": "YYYY-MM-DD",
+  "retrieved_at": "YYYY-MM-DDTHH:MM:SSZ",
+  "verified": false,
+  "verification_method": "REPLACE_WITH_REPRODUCIBLE_SOURCE_CHECK",
+  "evidence_uri": "REPLACE_WITH_PROVIDER_DOCUMENTATION_OR_LICENSED_SOURCE_RECORD"
+}

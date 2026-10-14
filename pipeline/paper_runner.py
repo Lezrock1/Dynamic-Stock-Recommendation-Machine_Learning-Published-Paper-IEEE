@@ -140,6 +140,8 @@ def exclusive_lock(database: str | Path) -> Iterator[None]:
 
 
 def _aware_utc(value: object) -> pd.Timestamp | None:
+    if value is None:
+        return None
     stamp = pd.Timestamp(str(value))
     return stamp.tz_convert("UTC") if stamp.tzinfo is not None else None
 
@@ -341,19 +343,31 @@ class PaperRunner:
         return status
 
     def _timeline_inputs(self, cycle: Mapping[str, object]) -> dict[str, str]:
-        """Publication and first-seen times of all expected filings; the snapshot cut-off is the
-        moment the last required filing became known, so only data available then is used."""
+        """Use actual filing timestamps plus recorded special-case evidence, never invented filing times."""
         rows = self.store.query(
-            "SELECT filed_at, first_seen_at FROM expected_filings WHERE cycle_id = ?", (cycle["cycle_id"],)
+            "SELECT e.filing_key, e.filed_at, e.first_seen_at, r.recorded_at "
+            "FROM expected_filings e LEFT JOIN filing_resolutions r "
+            "ON r.cycle_id = e.cycle_id AND r.filing_key = e.filing_key "
+            "WHERE e.cycle_id = ?",
+            (cycle["cycle_id"],),
         )
         published, seen = [], []
         for r in rows:
             p, f = _aware_utc(r["filed_at"]), _aware_utc(r["first_seen_at"])
+            resolved_at = _aware_utc(r["recorded_at"])
+            if resolved_at is not None:
+                seen.append(resolved_at)
+                continue
             if p is None or f is None:
-                raise ValidationError("every filing needs timezone-aware filed_at and first_seen_at")
+                raise ValidationError(f"filing {r['filing_key']} needs timezone-aware publication and first-seen times")
             published.append(p)
             seen.append(f)
+        if not published:
+            raise ValidationError("cycle has no published filing timestamp; resolutions cannot supply one")
         latest_seen = max(seen)
+        latest_published = max(published)
+        if latest_seen < latest_published:
+            raise ValidationError("first-seen evidence time precedes a filing publication time")
         return {"published_at": _iso(max(published)), "first_seen_at": _iso(latest_seen),
                 "snapshot_as_of": _iso(latest_seen)}
 
@@ -451,13 +465,30 @@ class PaperRunner:
             1 - self.config.cash_buffer_bps / 10_000)
         unit_cost = 1 + (self.config.transaction_cost_bps + self.config.slippage_bps) / 10_000
         orders: list[OrderRequest] = []
-        for symbol in sorted(set(held) | set(weights)):
-            target = math.floor(weights.get(symbol, 0.0) * budget / (prices[symbol] * unit_cost))
-            delta = target - held.get(symbol, 0.0)
-            if abs(delta) < 1e-9:
-                continue
-            side = OrderSide.BUY if delta > 0 else OrderSide.SELL
-            orders.append(OrderRequest(f"{cid}:{symbol}:{side.value}", symbol, side, abs(delta)))
+        if cycle["strategy"] == BENCHMARK_STRATEGY:
+            prior_spy_order = self.store.query(
+                "SELECT 1 FROM simulated_orders o JOIN execution_batches b ON b.batch_id = o.batch_id "
+                "JOIN reporting_cycles c ON c.cycle_id = b.cycle_id "
+                "WHERE c.portfolio_id = ? AND o.symbol = ? LIMIT 1",
+                (pid, BENCHMARK_SYMBOL),
+            )
+            if not prior_spy_order and weights.get(BENCHMARK_SYMBOL, 0.0) > 0:
+                target = math.floor(
+                    self.store.cash_balance(pid) * (1 - self.config.cash_buffer_bps / 10_000) /
+                    (prices[BENCHMARK_SYMBOL] * unit_cost)
+                )
+                if target > 0:
+                    orders.append(OrderRequest(
+                        f"{cid}:{BENCHMARK_SYMBOL}:BUY", BENCHMARK_SYMBOL, OrderSide.BUY, target
+                    ))
+        else:
+            for symbol in sorted(set(held) | set(weights)):
+                target = math.floor(weights.get(symbol, 0.0) * budget / (prices[symbol] * unit_cost))
+                delta = target - held.get(symbol, 0.0)
+                if abs(delta) < 1e-9:
+                    continue
+                side = OrderSide.BUY if delta > 0 else OrderSide.SELL
+                orders.append(OrderRequest(f"{cid}:{symbol}:{side.value}", symbol, side, abs(delta)))
         scheduled = self._first_session_opening_after(now)
         batch = f"batch:{cid}"
         if not existing:
@@ -509,34 +540,40 @@ class PaperRunner:
     def _apply_actions(self, session: str) -> None:
         stamp = _iso(session_close_time(session))
         portfolios = [str(r["portfolio_id"]) for r in self.store.query("SELECT portfolio_id FROM portfolios")]
-        held = sorted(str(r["symbol"]) for r in self.store.query(
-            "SELECT symbol FROM position_ledger GROUP BY symbol HAVING SUM(quantity_delta) > 1e-9"))
-        if not held:
-            return
-        for action in self.adapters.market.corporate_actions(session, held):
-            ex_day = action.ex_date or session
-            for pid in portfolios:
-                if self.store.position_balance(pid, action.symbol) <= 1e-9:
-                    continue
-                if ex_day != session and self._held_at(pid, action.symbol, ex_day) != \
-                        self.store.position_balance(pid, action.symbol):
-                    # holding changed after the ex-date: the claim cannot be derived mechanically
-                    continue
-                try:
-                    self.store.record_corporate_action(
-                        f"{action.action_id}:{pid}", pid, action.symbol, action.action_type,
-                        ex_day, action.value, action.source, pay_date=action.pay_date,
-                        created_at=stamp)
-                except DuplicateRecordError:
-                    if action.action_type == "dividend" and action.pay_date:
-                        try:
-                            self.store.set_dividend_pay_date(
-                                f"{action.action_id}:{pid}", action.pay_date, action.source, recorded_at=stamp)
-                        except (NotFoundError, StateError):
-                            pass
+        known_symbols = sorted(str(r["symbol"]) for r in self.store.query(
+            "SELECT DISTINCT symbol FROM position_ledger"))
+        if known_symbols:
+            for action in self.adapters.market.corporate_actions(session, known_symbols):
+                ex_day = action.ex_date or session
+                for pid in portfolios:
+                    entitled_quantity = None
+                    if action.action_type == "dividend":
+                        entitlement_session = previous_nyse_session(pd.Timestamp(ex_day)).date().isoformat()
+                        entitled_quantity = self._held_at(pid, action.symbol, entitlement_session)
+                        if entitled_quantity <= 1e-9:
+                            continue
+                    else:
+                        current_quantity = self.store.position_balance(pid, action.symbol)
+                        if current_quantity <= 1e-9:
+                            continue
+                        if ex_day != session and self._held_at(pid, action.symbol, ex_day) != current_quantity:
+                            continue
+                    try:
+                        self.store.record_corporate_action(
+                            f"{action.action_id}:{pid}", pid, action.symbol, action.action_type,
+                            ex_day, action.value, action.source, pay_date=action.pay_date,
+                            entitled_quantity=entitled_quantity,
+                            created_at=stamp)
+                    except DuplicateRecordError:
+                        if action.action_type == "dividend" and action.pay_date:
+                            try:
+                                self.store.set_dividend_pay_date(
+                                    f"{action.action_id}:{pid}", action.pay_date, action.source, recorded_at=stamp)
+                            except (NotFoundError, StateError):
+                                pass
         lookup = getattr(self.adapters.market, "pay_date", None)
         if lookup is not None:
-            # Open claims without a documented pay date stay receivables; a failed lookup changes nothing.
+            # Open claims are resolved independently of current holdings.
             for row in self.store.query(
                 "SELECT d.action_id, a.symbol, a.ex_date, a.value FROM dividend_receivables d "
                 "JOIN corporate_actions a ON a.action_id = d.action_id "
@@ -561,7 +598,7 @@ class PaperRunner:
     def _held_at(self, portfolio_id: str, symbol: str, session: str) -> float:
         rows = self.store.query(
             "SELECT COALESCE(SUM(quantity_delta), 0) AS q FROM position_ledger "
-            "WHERE portfolio_id = ? AND symbol = ? AND created_at <= ?",
+            "WHERE portfolio_id = ? AND symbol = ? AND julianday(created_at) <= julianday(?)",
             (portfolio_id, symbol, _iso(session_close_time(session))))
         return float(rows[0]["q"])
 
@@ -572,17 +609,34 @@ class PaperRunner:
             return
         positions = self.store.query(
             "SELECT symbol, SUM(quantity_delta) AS q FROM position_ledger WHERE portfolio_id = ? "
-            "GROUP BY symbol HAVING ABS(SUM(quantity_delta)) > 1e-9", (pid,))
-        value = sum(float(r["q"]) * self._price(str(r["symbol"]), session) for r in positions)
+            "AND julianday(created_at) <= julianday(?) "
+            "GROUP BY symbol HAVING ABS(SUM(quantity_delta)) > 1e-9", (pid, stamp))
+        position_values = {
+            str(row["symbol"]): (float(row["q"]), self._price(str(row["symbol"]), session))
+            for row in positions
+        }
+        value = sum(quantity * price for quantity, price in position_values.values())
         created = pd.Timestamp(str(portfolio["created_at"])).tz_convert("UTC")
         base_session = previous_nyse_session(self._first_session(created)).date().isoformat()
         base, level = self.adapters.market.benchmark(base_session), self.adapters.market.benchmark(session)
         if not base or not level or base <= 0 or level <= 0:
             raise MissingDataError(f"benchmark value missing for {base_session} or {session}")
-        cash, recv = self.store.cash_balance(pid), self.store.receivable_balance(pid)
+        cash = float(self.store.query(
+            "SELECT COALESCE(SUM(amount), 0) AS balance FROM cash_ledger "
+            "WHERE portfolio_id = ? AND julianday(created_at) <= julianday(?)",
+            (pid, stamp),
+        )[0]["balance"])
+        recv = float(self.store.query(
+            """SELECT COALESCE(SUM(r.amount), 0) AS amount
+               FROM dividend_receivables r
+               JOIN corporate_actions a ON a.action_id = r.action_id
+               WHERE r.portfolio_id = ? AND julianday(a.created_at) <= julianday(?)
+                 AND (r.status = 'RECEIVABLE' OR julianday(r.paid_at) > julianday(?))""",
+            (pid, stamp, stamp),
+        )[0]["amount"])
         self.store.record_daily_mark(
             pid, stamp, cash, value, cash + value + recv,
-            float(portfolio["initial_cash"]) * level / base, recv)
+            float(portfolio["initial_cash"]) * level / base, recv, position_values)
 
     @staticmethod
     def _first_session(created: pd.Timestamp) -> pd.Timestamp:

@@ -71,6 +71,57 @@ class SpyAndLateDividend(base.RunnerFlowTests):
         bps = self.runner().config.transaction_cost_bps + self.runner().config.slippage_bps
         self.assertLessEqual(spy[0]["transaction_cost"], notional * bps / 10_000 * 1.0001 + 1e-9)
 
+    def test_spy_buy_and_hold_has_no_followup_order_across_cycle_and_restart(self) -> None:
+        for key in KEYS:
+            self.adapters.filings.arrive(key, "2026-01-05T12:00:00+00:00")
+        self.now = utc("2026-01-06T15:00:00")
+        runner = self.runner()
+        runner.tick()
+        self.now = utc("2026-01-07T22:00:00")
+        runner.tick()
+        store = PaperStore(self.database)
+        first_fills = store.query(
+            "SELECT f.execution_id, f.transaction_cost FROM simulated_fills f "
+            "JOIN simulated_orders o ON o.order_id = f.order_id "
+            "JOIN execution_batches b ON b.batch_id = o.batch_id "
+            "JOIN reporting_cycles c ON c.cycle_id = b.cycle_id "
+            "WHERE c.portfolio_id = 'spy_benchmark'"
+        )
+        self.assertEqual(len(first_fills), 1)
+        initial_cost = first_fills[0]["transaction_cost"]
+
+        for portfolio_id in (*base.STRATEGIES, "spy_benchmark"):
+            cycle_id = store.create_cycle(
+                portfolio_id, "2026Q1", portfolio_id,
+                started_at="2026-01-08T20:00:00+00:00",
+            )
+            store.register_expected_filings(cycle_id, KEYS, filing_metadata={
+                key: {"company_id": key.split("-")[0], "expected_period": "2026Q1", "filing_type": "10-Q"}
+                for key in KEYS
+            })
+        self.now = utc("2026-01-08T20:00:00")
+        runner.tick()
+        self.assertEqual(store.query(
+            "SELECT COUNT(*) AS n FROM simulated_orders o "
+            "JOIN execution_batches b ON b.batch_id = o.batch_id "
+            "JOIN reporting_cycles c ON c.cycle_id = b.cycle_id "
+            "WHERE c.portfolio_id = 'spy_benchmark'"
+        )[0]["n"], 1)
+
+        self.now = utc("2026-01-09T22:00:00")
+        restarted = self.runner()
+        restarted.tick()
+        later_fills = store.query(
+            "SELECT f.execution_id, f.transaction_cost FROM simulated_fills f "
+            "JOIN simulated_orders o ON o.order_id = f.order_id "
+            "JOIN execution_batches b ON b.batch_id = o.batch_id "
+            "JOIN reporting_cycles c ON c.cycle_id = b.cycle_id "
+            "WHERE c.portfolio_id = 'spy_benchmark'"
+        )
+        self.assertEqual(len(later_fills), 1)
+        self.assertEqual(later_fills[0]["execution_id"], first_fills[0]["execution_id"])
+        self.assertEqual(later_fills[0]["transaction_cost"], initial_cost)
+
     def test_dashboard_separates_report_states_and_compares_weights(self) -> None:
         from pipeline.paper_dashboard import dashboard_snapshot
         for key in KEYS[:-1]:
@@ -112,6 +163,45 @@ class SpyAndLateDividend(base.RunnerFlowTests):
         with self.assertRaises(Exception):
             runner._validated_payload(result(True, False), snapshot, cycles)
         runner._validated_payload(result(True, True), snapshot, cycles)
+
+    def test_late_discovered_dividend_uses_pre_ex_date_holdings_after_sale(self) -> None:
+        store = PaperStore(self.database)
+        store.create_portfolio("late_dividend", "Late dividend", "late_dividend_v1", 5_000.0,
+                               created_at="2026-01-05T15:00:00+00:00")
+        buy_cycle = store.create_cycle("late_dividend", "buy", "late_dividend_v1")
+        store.rebalance(
+            buy_cycle, "late_dividend_v1", "buy-batch", {"AAA": 1.0},
+            [base.OrderRequest("buy-aaa", "AAA", base.OrderSide.BUY, 10)],
+        )
+        buy = store.orders_for_batch("buy-batch")[0]
+        store.record_fill("buy-fill", buy.order_id, 10, 100.0, filled_at="2026-01-07T21:00:00+00:00")
+
+        sell_cycle = store.create_cycle("late_dividend", "sell", "late_dividend_v1")
+        store.rebalance(
+            sell_cycle, "late_dividend_v1", "sell-batch", {"AAA": 0.0},
+            [base.OrderRequest("sell-aaa", "AAA", base.OrderSide.SELL, 10)],
+        )
+        sell = store.orders_for_batch("sell-batch")[0]
+        store.record_fill("sell-fill", sell.order_id, 10, 101.0, filled_at="2026-01-09T21:00:00+00:00")
+        self.assertEqual(store.position_balance("late_dividend", "AAA"), 0.0)
+
+        self.adapters.market.actions = {
+            "2026-01-12": [
+                CorporateAction("late-div", "AAA", "dividend", 2.0, "synthetic",
+                                "2026-01-12", "2026-01-08")
+            ]
+        }
+        runner = self.runner()
+        cash_before_dividend = store.cash_balance("late_dividend")
+        runner._apply_actions("2026-01-12")
+
+        self.assertEqual(store.receivable_balance("late_dividend"), 0.0)
+        self.assertAlmostEqual(store.cash_balance("late_dividend"), cash_before_dividend + 20.0)
+        self.assertEqual(store.query(
+            "SELECT amount, status FROM dividend_receivables WHERE action_id = 'late-div:late_dividend'"
+        ), [{"amount": 20.0, "status": "PAID"}])
+        runner._apply_actions("2026-01-12")
+        self.assertAlmostEqual(store.cash_balance("late_dividend"), cash_before_dividend + 20.0)
 
     def test_failed_calendar_keeps_known_claim(self) -> None:
         for key in KEYS:

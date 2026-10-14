@@ -11,11 +11,11 @@ import uuid
 
 try:
     from .paper_dashboard import DEFAULT_DB, SYNTHETIC_DB, dashboard_snapshot, serve
-    from .paper_runner import PaperRunner, RunnerConfig, load_adapters
+    from .paper_runner import PaperRunner, RunnerConfig, exclusive_lock, load_adapters
     from .paper_store import PaperStore
 except ImportError:
     from paper_dashboard import DEFAULT_DB, SYNTHETIC_DB, dashboard_snapshot, serve
-    from paper_runner import PaperRunner, RunnerConfig, load_adapters
+    from paper_runner import PaperRunner, RunnerConfig, exclusive_lock, load_adapters
     from paper_store import PaperStore
 
 STRATEGIES = {
@@ -89,6 +89,12 @@ def run_cli(argv: list[str] | None = None) -> None:
     generate.add_argument("--cycle-key", required=True)
     generate.add_argument("--quarter-end", required=True, help="calendar quarter end, e.g. 2026-09-30")
     generate.add_argument("--deadline-at")
+
+    correct = commands.add_parser(
+        "correct-periods", help="re-derive expected periods of a not yet used cycle with the current period rule")
+    correct.add_argument("--cycle-key", required=True)
+    correct.add_argument("--quarter-end", required=True)
+    correct.add_argument("--apply", action="store_true", help="without it only the audit is printed")
 
     backup = commands.add_parser("backup", help="create a consistent SQLite backup")
     backup.add_argument("--output", type=Path, required=True)
@@ -201,9 +207,11 @@ def run_cli(argv: list[str] | None = None) -> None:
             parser.error("--adapters is required for the synthetic environment")
         runner = PaperRunner(store, load_adapters(spec), RunnerConfig())
         if args.command == "check-filings":
-            print(json.dumps(runner.check_filings(args.cycle_key), default=str))
+            with exclusive_lock(store.path):
+                print(json.dumps(runner.check_filings(args.cycle_key), default=str))
         elif args.command == "run-signal":
-            print(json.dumps({"result": runner.run_signal(args.cycle_key)}))
+            with exclusive_lock(store.path):
+                print(json.dumps({"result": runner.run_signal(args.cycle_key)}))
         elif args.command == "tick":
             print(json.dumps(runner.tick(), default=str))
         else:
@@ -240,6 +248,16 @@ def run_cli(argv: list[str] | None = None) -> None:
             from paper_live import create_real_cycle
         print(json.dumps(create_real_cycle(store, real_config, args.cycle_key, args.quarter_end,
                                            args.deadline_at), indent=2))
+        return
+    if args.command == "correct-periods":
+        if args.env != "real":
+            parser.error("correct-periods needs --env real")
+        try:
+            from .paper_live import correct_expected_periods
+        except ImportError:
+            from paper_live import correct_expected_periods
+        print(json.dumps(correct_expected_periods(store, real_config, args.cycle_key, args.quarter_end, args.apply),
+                         indent=2))
         return
     if args.command == "create-cycle":
         keys, metadata = _load_expected_filings(args.expected_filings)

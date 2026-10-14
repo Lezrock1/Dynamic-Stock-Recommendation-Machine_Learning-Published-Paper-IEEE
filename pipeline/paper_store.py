@@ -20,7 +20,7 @@ from typing import Iterator, Mapping, Sequence
 
 
 _APPLICATION_ID = 0x50535452
-_SCHEMA_VERSION = 4
+_SCHEMA_VERSION = 5
 ENVIRONMENTS = ("real", "synthetic", "test")
 _V3_STATEMENTS = (
     """CREATE TABLE IF NOT EXISTS store_meta (
@@ -69,6 +69,14 @@ _V4_STATEMENTS = (
         source TEXT NOT NULL,
         recorded_at TEXT NOT NULL
     )""",
+)
+_V5_STATEMENTS = (
+    """CREATE TRIGGER IF NOT EXISTS daily_marks_no_update
+        BEFORE UPDATE ON daily_marks
+        BEGIN SELECT RAISE(ABORT, 'daily marks are immutable'); END""",
+    """CREATE TRIGGER IF NOT EXISTS daily_marks_no_delete
+        BEFORE DELETE ON daily_marks
+        BEGIN SELECT RAISE(ABORT, 'daily marks are immutable'); END""",
 )
 _SCHEMA_TABLES = {
     "filing_resolutions",
@@ -414,6 +422,7 @@ class PaperStore:
                     dividend_receivables REAL NOT NULL DEFAULT 0,
                     nav REAL NOT NULL,
                     benchmark_value REAL NOT NULL,
+                    position_values_json TEXT,
                     PRIMARY KEY(portfolio_id, marked_at)
                 )""",
                 """CREATE TABLE job_runs (
@@ -486,7 +495,7 @@ class PaperStore:
                     BEFORE DELETE ON job_errors
                     BEGIN SELECT RAISE(ABORT, 'job errors are append-only'); END""",
             )
-            for statement in statements + _V3_STATEMENTS + _V4_STATEMENTS:
+            for statement in statements + _V3_STATEMENTS + _V4_STATEMENTS + _V5_STATEMENTS:
                 connection.execute(statement)
             connection.execute(
                 "INSERT INTO store_meta (key, value) VALUES ('environment', ?)", (environment,)
@@ -598,6 +607,14 @@ class PaperStore:
                         "pay_date, status, paid_at FROM dividend_receivables_v3")
                     connection.execute("DROP TABLE dividend_receivables_v3")
                     for statement in _V4_STATEMENTS:
+                        connection.execute(statement)
+                if version < 5:
+                    columns = {
+                        row[1] for row in connection.execute("PRAGMA table_info(daily_marks)")
+                    }
+                    if "position_values_json" not in columns:
+                        connection.execute("ALTER TABLE daily_marks ADD COLUMN position_values_json TEXT")
+                    for statement in _V5_STATEMENTS:
                         connection.execute(statement)
                 connection.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
                 connection.commit()
@@ -1277,6 +1294,7 @@ class PaperStore:
         nav: float,
         benchmark_value: float,
         dividend_receivables: float = 0.0,
+        position_values: Mapping[str, tuple[float, float]] | None = None,
     ) -> None:
         portfolio_id = _identifier(portfolio_id, "portfolio_id")
         marked_at = _timestamp(marked_at)
@@ -1285,6 +1303,24 @@ class PaperStore:
         dividend_receivables = _number(dividend_receivables, "dividend_receivables", minimum=0)
         nav = _number(nav, "nav", minimum=0, minimum_inclusive=False)
         benchmark_value = _number(benchmark_value, "benchmark_value", minimum=0, minimum_inclusive=False)
+        serialized_positions = None
+        if position_values is not None:
+            marked_positions: dict[str, dict[str, float]] = {}
+            for symbol, (quantity, price) in position_values.items():
+                symbol = _identifier(symbol, "symbol")
+                quantity = _number(quantity, f"quantity[{symbol}]", minimum=0, minimum_inclusive=False)
+                price = _number(price, f"price[{symbol}]", minimum=0, minimum_inclusive=False)
+                marked_positions[symbol] = {
+                    "quantity": quantity,
+                    "price": price,
+                    "market_value": quantity * price,
+                }
+            marked_value = math.fsum(item["market_value"] for item in marked_positions.values())
+            if not math.isclose(marked_value, positions_value, rel_tol=1e-9, abs_tol=1e-8):
+                raise ValidationError("position marks must sum to positions_value")
+            serialized_positions = json.dumps(
+                marked_positions, sort_keys=True, separators=(",", ":"), allow_nan=False
+            )
         if not math.isclose(
             nav, cash + positions_value + dividend_receivables, rel_tol=1e-9, abs_tol=1e-8
         ):
@@ -1302,11 +1338,11 @@ class PaperStore:
             connection.execute(
                 """INSERT INTO daily_marks
                    (portfolio_id, marked_at, cash, positions_value, dividend_receivables,
-                    nav, benchmark_value)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    nav, benchmark_value, position_values_json)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     portfolio_id, marked_at, cash, positions_value,
-                    dividend_receivables, nav, benchmark_value,
+                    dividend_receivables, nav, benchmark_value, serialized_positions,
                 ),
             )
 
@@ -1473,6 +1509,7 @@ class PaperStore:
         *,
         pay_date: str | None = None,
         created_at: str | None = None,
+        entitled_quantity: float | None = None,
     ) -> str:
         """Book a split, cash dividend receivable, or cash-settled delisting once."""
         action_id = _identifier(action_id, "action_id")
@@ -1497,6 +1534,12 @@ class PaperStore:
         elif pay_date is not None:
             raise ValidationError("pay_date is only valid for cash dividends")
         created_at = _timestamp(created_at)
+        if entitled_quantity is not None and action_type != "dividend":
+            raise ValidationError("entitled_quantity is only valid for dividend actions")
+        if entitled_quantity is not None:
+            entitled_quantity = _number(
+                entitled_quantity, "entitled_quantity", minimum=0
+            )
         with self._transaction() as connection:
             self._require_row(
                 connection, "SELECT 1 FROM portfolios WHERE portfolio_id = ?",
@@ -1513,8 +1556,9 @@ class PaperStore:
             ).fetchone()[0])
             if held < -1e-9:
                 raise StateError(f"Position ledger is short {symbol} before action")
+            dividend_quantity = held if entitled_quantity is None else entitled_quantity
             status = (
-                "NO_POSITION" if held <= 1e-9 else
+                "NO_POSITION" if (dividend_quantity if action_type == "dividend" else held) <= 1e-9 else
                 "RECEIVABLE" if action_type == "dividend" else
                 "SETTLED" if action_type == "cash_delisting" else
                 "APPLIED"
@@ -1540,12 +1584,12 @@ class PaperStore:
                         symbol, held * (value - 1.0), created_at, f"split:{action_id}",
                     ),
                 )
-            elif held > 1e-9 and action_type == "dividend":
+            elif dividend_quantity > 1e-9 and action_type == "dividend":
                 connection.execute(
                     """INSERT INTO dividend_receivables
                        (action_id, portfolio_id, symbol, amount, pay_date, status)
                        VALUES (?, ?, ?, ?, ?, 'RECEIVABLE')""",
-                    (action_id, portfolio_id, symbol, held * value, pay_date),
+                    (action_id, portfolio_id, symbol, dividend_quantity * value, pay_date),
                 )
             elif held > 1e-9 and action_type == "cash_delisting":
                 connection.execute(

@@ -21,21 +21,34 @@ GICS_SECTORS = {
     30: "Basiskonsumgüter", 35: "Gesundheitswesen", 40: "Finanzwesen", 45: "Informationstechnologie",
     50: "Kommunikationsdienste", 55: "Versorger", 60: "Immobilien",
 }
+SYMBOL_ALIASES = {"BRK.B": "BRK-B", "BF.B": "BF-B"}
+
+
+def _canonical_symbol(symbol: str) -> str:
+    value = str(symbol).strip().upper()
+    return SYMBOL_ALIASES.get(value, value)
+
+
+def _universe_metadata(universe_as_of: str | None) -> tuple[dict[str, int], dict[str, str]]:
+    if not universe_as_of:
+        return {}, {}
+    import pandas as pd
+    try:
+        from . import universe_asof as ua
+    except ImportError:
+        import universe_asof as ua  # type: ignore[no-redef]
+    members, _ = ua.members_as_of(pd.Timestamp(universe_as_of))
+    sectors = {_canonical_symbol(str(row.tic)): int(row.gsector) for row in members.itertuples()}
+    names = {
+        _canonical_symbol(str(row.tic)): str(row.conm)
+        for row in members.itertuples()
+        if getattr(row, "conm", None) and str(row.conm).strip()
+    }
+    return sectors, names
 
 
 def _sector_lookup(universe_as_of: str | None) -> dict[str, int]:
-    if not universe_as_of:
-        return {}
-    try:
-        import pandas as pd
-        try:
-            from . import universe_asof as ua
-        except ImportError:
-            import universe_asof as ua  # type: ignore[no-redef]
-        members, _ = ua.members_as_of(pd.Timestamp(universe_as_of))
-        return {str(t): int(g) for t, g in zip(members["tic"], members["gsector"])}
-    except Exception:
-        return {}
+    return _universe_metadata(universe_as_of)[0]
 
 
 def _report_status(connection: sqlite3.Connection, cycle_id: str) -> dict[str, Any]:
@@ -44,14 +57,22 @@ def _report_status(connection: sqlite3.Connection, cycle_id: str) -> dict[str, A
         "SELECT f.filing_key, f.company_id, f.expected_period, f.status, r.resolution, r.evidence_json, r.recorded_at "
         "FROM expected_filings f LEFT JOIN filing_resolutions r ON r.cycle_id = f.cycle_id "
         "AND r.filing_key = f.filing_key WHERE f.cycle_id = ? ORDER BY f.company_id", (cycle_id,)).fetchall()
-    ready = [r["company_id"] for r in rows if r["status"] == "READY"]
+    ready = [r["company_id"] for r in rows if r["status"] == "READY" and not r["resolution"]]
     special = [{"company_id": r["company_id"], "filing_key": r["filing_key"], "resolution": r["resolution"],
                 "evidence": json.loads(r["evidence_json"]), "recorded_at": r["recorded_at"]}
-               for r in rows if r["resolution"] and r["status"] != "READY"]
+               for r in rows if r["resolution"]]
     special_keys = {x["filing_key"] for x in special}
     open_cases = [{"company_id": r["company_id"], "expected_period": r["expected_period"], "status": r["status"]}
                   for r in rows if r["status"] != "READY" and r["filing_key"] not in special_keys]
+    groups = {
+        "READY": len(ready),
+        "WAITING_FACTS": sum(1 for c in open_cases if c["status"] == "WAITING_FACTS"),
+        "CORPORATE_ACTION_RESOLVED": len(special),
+        "WAITING_FILING": sum(1 for c in open_cases if c["status"] == "WAITING_FILING"),
+        "INVALID_DATA": sum(1 for c in open_cases if c["status"] == "INVALID_DATA"),
+    }
     return {"expected": len(rows), "ready": len(ready), "special_cases": special, "open": len(open_cases),
+            "status_groups": groups, "status_groups_sum": sum(groups.values()),
             "open_cases": open_cases, "gate_satisfied": not open_cases,
             "note": "CORPORATE_ACTION_RESOLVED is evidence-based and not READY; open cases include ordinary data gaps."}
 
@@ -64,55 +85,120 @@ def _weight_comparison(connection: sqlite3.Connection, environment: str, report_
     benchmark = benchmark_weights.latest() if environment == "real" else None
     result: dict[str, Any] = {
         "benchmark": ({"source": benchmark["source_url"], "as_of": benchmark["as_of"], "sha256": benchmark["sha256"],
-                       "kind": benchmark["kind"]} if benchmark else None),
-        "signal": None, "rows": [], "sectors": [], "diagnostic": False,
+                       "kind": benchmark["kind"], "symbol_aliases": {}} if benchmark else None),
+        "signal": None, "rows": [], "sectors": [], "diagnostic": False, "actual_marked_at": {},
         "banner": "Kein gültiges ML-Signal gespeichert: keine Zielgewichte vorhanden." if not signal else None}
     payload = json.loads(signal["payload_json"]) if signal else {}
     data = payload.get("data", {})
     if signal:
-        result["diagnostic"] = data.get("eligibility_enforced") is False
+        diagnostic_symbols = {
+            str(record.get("security_id"))
+            for record in data.get("forecast_records", [])
+            if record.get("forecast_kind") == "DIAGNOSTIC_ONLY"
+        }
+        stored_targets = payload.get("target_weights", {})
+        targeted_diagnostics = any(
+            diagnostic_symbols.intersection(weights)
+            for weights in stored_targets.values()
+        )
+        result["diagnostic"] = data.get("eligibility_enforced") is not True or targeted_diagnostics
         result["signal"] = {"signal_id": signal["signal_id"], "signal_as_of": payload.get("signal_as_of"),
                             "created_at": signal["created_at"], "universe_as_of": data.get("universe_as_of"),
-                            "price_session": data.get("price_session"), "panel_fingerprint": data.get("panel_fingerprint")}
+                            "price_session": data.get("price_session"), "panel_fingerprint": data.get("panel_fingerprint"),
+                            "origin": data.get("origin")}
         if result["diagnostic"]:
             result["banner"] = "DIAGNOSELAUF - kein gültiges Portfolio"
     ml = [p for p in portfolios if "spy" not in p["strategy"]]
     names = [p["portfolio_id"] for p in ml]
     result["portfolios"] = names
     payload_targets = payload.get("target_weights", {}) if signal and not result["diagnostic"] else {}
-    targets = {p["portfolio_id"]: payload_targets.get(p["strategy"], {}) for p in ml}
-    actual: dict[str, dict[str, float]] = {}
+    targets: dict[str, dict[str, float]] = {}
+    for portfolio in ml:
+        weights = payload_targets.get(portfolio["strategy"], {})
+        normalized: dict[str, float] = {}
+        for symbol, weight in weights.items():
+            canonical = _canonical_symbol(symbol)
+            if canonical in normalized:
+                raise ValueError(f"duplicate ticker aliases in target weights for {portfolio['strategy']}: {canonical}")
+            normalized[canonical] = float(weight)
+        targets[portfolio["portfolio_id"]] = normalized
+    actual: dict[str, dict[str, float] | None] = {}
     for p in ml:
-        prices = {r["symbol"]: r["price"] for r in connection.execute(
-            "SELECT o.symbol, f.price FROM simulated_fills f JOIN simulated_orders o ON o.order_id = f.order_id "
-            "JOIN execution_batches b ON b.batch_id = o.batch_id JOIN reporting_cycles c ON c.cycle_id = b.cycle_id "
-            "WHERE c.portfolio_id = ? ORDER BY f.filled_at", (p["portfolio_id"],))}
-        nav = (p["latest_mark"] or {}).get("nav")
-        if nav:
-            actual[p["portfolio_id"]] = {x["symbol"]: x["quantity"] * prices[x["symbol"]] / nav
-                                         for x in p["positions"] if x["symbol"] in prices}
-    sectors = _sector_lookup(data.get("universe_as_of") or (benchmark or {}).get("as_of"))
-    symbols = set((benchmark or {}).get("weights", {})) | {t for w in targets.values() for t in w}
-    symbols |= {t for w in actual.values() for t in w}
+        latest = p["latest_mark"] or {}
+        nav = latest.get("nav")
+        raw_values = latest.get("position_values_json")
+        if raw_values is None or not nav:
+            actual[p["portfolio_id"]] = None
+            continue
+        marked_values = json.loads(raw_values)
+        normalized_values: dict[str, float] = {}
+        for symbol, item in marked_values.items():
+            canonical = _canonical_symbol(symbol)
+            if canonical in normalized_values:
+                raise ValueError(f"duplicate ticker aliases in daily mark for {p['portfolio_id']}: {canonical}")
+            normalized_values[canonical] = float(item["market_value"]) / float(nav)
+        actual[p["portfolio_id"]] = normalized_values
+        result["actual_marked_at"][p["portfolio_id"]] = latest["marked_at"]
+    sectors, company_names = _universe_metadata(data.get("universe_as_of") or (benchmark or {}).get("as_of"))
+    benchmark_values: dict[str, float] = {}
+    aliases_applied: dict[str, str] = {}
+    for raw_symbol, weight in (benchmark or {}).get("weights", {}).items():
+        symbol = _canonical_symbol(raw_symbol)
+        if symbol in benchmark_values:
+            raise ValueError(f"duplicate ticker aliases in benchmark holdings: {symbol}")
+        benchmark_values[symbol] = float(weight)
+        if symbol != raw_symbol:
+            aliases_applied[raw_symbol] = symbol
+    if benchmark:
+        result["benchmark"]["symbol_aliases"] = aliases_applied
+    symbols = set(benchmark_values) | {t for weights in targets.values() for t in weights}
+    symbols |= {t for weights in actual.values() if weights is not None for t in weights}
     rows = []
     for symbol in symbols:
-        row = {"symbol": symbol, "sector": GICS_SECTORS.get(sectors.get(symbol), "unbekannt"),
-               "benchmark_weight": (benchmark or {}).get("weights", {}).get(symbol)}
+        row = {"symbol": symbol, "name": company_names.get(symbol),
+               "sector": GICS_SECTORS.get(sectors.get(symbol), "unbekannt"),
+               "benchmark_weight": benchmark_values.get(symbol)}
         for name in names:
-            row[f"target_{name}"] = targets.get(name, {}).get(symbol)
-            row[f"actual_{name}"] = actual.get(name, {}).get(symbol)
+            row[f"target_{name}"] = targets[name].get(symbol, 0.0) if targets.get(name) else None
+            actual_weights = actual.get(name)
+            row[f"actual_{name}"] = actual_weights.get(symbol, 0.0) if actual_weights is not None else None
+            target_weight = row[f"target_{name}"]
+            actual_weight = row[f"actual_{name}"]
+            row[f"target_active_{name}"] = (
+                target_weight - row["benchmark_weight"]
+                if target_weight is not None and row["benchmark_weight"] is not None else None
+            )
+            row[f"actual_active_{name}"] = (
+                actual_weight - row["benchmark_weight"]
+                if actual_weight is not None and row["benchmark_weight"] is not None else None
+            )
         rows.append(row)
     rows.sort(key=lambda r: (-(r["benchmark_weight"] or 0.0), r["symbol"]))
     result["rows"] = rows
-    totals: dict[str, dict[str, float]] = {}
+    totals: dict[str, dict[str, float | None]] = {}
     for r in rows:
-        t = totals.setdefault(r["sector"], {"benchmark_weight": 0.0, **{f"{k}_{n}": 0.0 for k in ("target", "actual")
-                                                                          for n in names}})
-        for key in t:
-            t[key] += r.get(key) or 0.0
-    result["sectors"] = sorted(({"sector": k, **v} for k, v in totals.items()), key=lambda x: -x["benchmark_weight"])
+        t = totals.setdefault(r["sector"], {
+            "benchmark_weight": 0.0 if benchmark else None,
+            **{f"{kind}_{n}": (0.0 if kind == "target" and targets.get(n) else
+                               0.0 if kind == "actual" and actual.get(n) is not None else None)
+               for kind in ("target", "actual") for n in names},
+        })
+        if t["benchmark_weight"] is not None and r["benchmark_weight"] is not None:
+            t["benchmark_weight"] += r["benchmark_weight"]
+        for name in names:
+            for kind in ("target", "actual"):
+                key = f"{kind}_{name}"
+                value = r[f"{kind}_{name}"]
+                if t[key] is not None and value is not None:
+                    t[key] += value
+    result["sectors"] = sorted(
+        ({"sector": k, **v} for k, v in totals.items()),
+        key=lambda x: -(x["benchmark_weight"] or 0.0),
+    )
     result["note"] = ("Benchmarkgewichte: SPY-ETF-Bestand laut Fondsdatei zum angegebenen Stichtag (nicht S&P-Index, "
-                      "nicht zwingend der Depotstart). Tatsächliche Gewichte: Stück x letzter Fill-Preis / NAV.")
+                      "nicht zwingend der Depotstart). Tatsächliche Gewichte: gespeicherter Marktwert je Aktie / "
+                      "NAV aus demselben Bewertungszeitpunkt; ohne Positionspreis-Snapshot werden sie nicht angezeigt.")
+    result["benchmark_label"] = "SPY-ETF-Bestände als S&P-500-Proxy; kein S&P-500-Indexgewicht"
     return result
 
 STATE_DIR = Path(__file__).resolve().parent.parent / "state"
@@ -131,19 +217,24 @@ _HTML = """<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Paper-Depot</title>
 <style>
-body{font:16px system-ui,sans-serif;max-width:1100px;margin:2rem auto;padding:0 1rem;background:#f4f6f8;color:#15202b}
+body{font:16px system-ui,sans-serif;max-width:1250px;margin:2rem auto;padding:0 1rem;background:#f4f6f8;color:#15202b}
 h1{margin-bottom:.25rem}.muted{color:#52606d}.card{background:white;border:1px solid #d8e0e8;border-radius:10px;padding:1rem;margin:1rem 0}
-table{border-collapse:collapse;font-size:13px}td,th{border:1px solid #d8e0e8;padding:2px 6px;text-align:right}td:first-child,th:first-child,td.l{text-align:left}pre{white-space:pre-wrap;overflow-wrap:anywhere;margin:0}.warn{color:#8a3b00;font-weight:600}
+table{border-collapse:collapse;font-size:13px;width:100%}td,th{border:1px solid #d8e0e8;padding:4px 6px;text-align:right}td:first-child,th:first-child,td.l{text-align:left}pre{white-space:pre-wrap;overflow-wrap:anywhere;margin:0}.warn{color:#8a3b00;font-weight:600}
+.bar-group{padding:.4rem 0;border-bottom:1px solid #edf0f3;font-size:12px}.bar{display:inline-block;height:10px;max-width:55%;margin:0 .25rem}
+#nav-chart svg{width:100%;height:310px;border-bottom:1px solid #d8e0e8}#nav-chart p{font-size:12px}
 </style>
 </head>
 <body>
 <h1>Virtuelles Paper-Depot</h1>
 <p id="banner" class="warn"></p>
-<p class="muted">Nur simulierte Buchungen. Keine Brokerorders. Aktualisierung: beim Neuladen.</p>
+<p id="refresh" class="muted">Nur simulierte Buchungen. Keine Brokerorders.</p>
 <section class="card"><h2>Status</h2><pre id="status">Lade lokalen Depotstatus …</pre></section>
 <section class="card"><h2>Berichtsbereitschaft</h2><div id="reports">Lade …</div></section>
 <section class="card"><h2>Gewichtsvergleich je Aktie</h2><p id="wbanner" class="warn"></p><p id="wnote" class="muted"></p><div id="weights">Lade …</div></section>
+<section class="card"><h2>Größte Titel: Benchmark, Ziel und Ist</h2><div id="stock-bars"></div></section>
 <section class="card"><h2>Sektorvergleich</h2><div id="sectors">Lade …</div></section>
+<section class="card"><h2>Vermögenswerte, Cash und Dividendenforderungen</h2><div id="accounts"></div></section>
+<section class="card"><h2>NAV-Verlauf ab gemeinsamem tatsächlichem Start</h2><p id="nav-note" class="muted"></p><div id="nav-chart"></div></section>
 <section class="card"><h2>Berichte & Zyklen</h2><pre id="cycles">Lade …</pre></section>
 <section class="card"><h2>Aufträge & letzte Läufe</h2><pre id="operations">Lade …</pre></section>
 <script>
@@ -162,15 +253,47 @@ async function load() {
   }, null, 2);
   const pct = v => v == null ? '–' : (100 * v).toFixed(2) + ' %';
   const esc = t => String(t).replace(/[&<>]/g, c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;'}[c]));
+  document.querySelector('#refresh').textContent =
+    `Nur simulierte Buchungen. Keine Brokerorders. Automatische Anzeigeaktualisierung alle ${data.automatic_refresh_seconds} Sekunden; Stand ${new Date().toLocaleString()}.`;
   const rs = data.report_status;
-  document.querySelector('#reports').innerHTML = rs ? `<p>Erwartet: ${rs.expected} | <b>READY: ${rs.ready}</b> | belegte Sonderfälle (nicht READY): ${rs.special_cases.length} | offen: ${rs.open} | Gate erfüllt: ${rs.gate_satisfied ? 'ja' : 'nein'}</p>` +
-    '<h3>Belegte Sonderfälle</h3><pre>' + esc(JSON.stringify(rs.special_cases, null, 1)) + '</pre><h3>Offene Berichte</h3><pre>' + esc(rs.open_cases.map(c => c.company_id + ' ' + c.expected_period + ' ' + c.status).join('\n')) + '</pre>' : 'Kein Zyklus.';
+  document.querySelector('#reports').innerHTML = rs ? `<p>Erwartet: ${rs.expected} | <b>READY: ${rs.ready}</b> | belegte Sonderfälle (nicht READY): ${rs.special_cases.length} | offen: ${rs.open} (WAITING_FACTS ${rs.status_groups.WAITING_FACTS} + WAITING_FILING ${rs.status_groups.WAITING_FILING} + INVALID_DATA ${rs.status_groups.INVALID_DATA}) | Summe: ${rs.status_groups_sum} | Gate erfüllt: ${rs.gate_satisfied ? 'ja' : 'nein'}</p>` +
+    '<h3>Belegte Sonderfälle</h3><pre>' + esc(JSON.stringify(rs.special_cases, null, 1)) + '</pre><h3>Offene Berichte</h3><pre>' + esc(rs.open_cases.map(c => c.company_id + ' ' + c.expected_period + ' ' + c.status).join('\\n')) + '</pre>' : 'Kein Zyklus.';
   const w = data.weight_comparison;
   document.querySelector('#wbanner').textContent = w.banner || '';
-  document.querySelector('#wnote').textContent = (w.benchmark ? 'Benchmark-Quelle: ' + w.benchmark.source + ' (Stand ' + w.benchmark.as_of + ', SHA-256 ' + w.benchmark.sha256.slice(0, 16) + '…). ' : 'Keine Benchmarkgewichte. ') + w.note + (w.signal ? ' Signal: ' + w.signal.signal_as_of + ', Kursstand ' + w.signal.price_session : '');
-  const head = '<tr><th>Aktie</th><th>Sektor</th><th>Benchmark</th>' + w.portfolios.map(n => `<th>Ziel ${n}</th><th>Ist ${n}</th>`).join('') + '</tr>';
-  document.querySelector('#weights').innerHTML = '<table>' + head + w.rows.map(r => `<tr><td>${esc(r.symbol)}</td><td class="l">${esc(r.sector)}</td><td>${pct(r.benchmark_weight)}</td>` + w.portfolios.map(n => `<td>${pct(r['target_' + n])}</td><td>${pct(r['actual_' + n])}</td>`).join('') + '</tr>').join('') + '</table>';
-  document.querySelector('#sectors').innerHTML = '<table>' + head.replace('Aktie', 'Sektor').replace('<th>Sektor</th>', '') + w.sectors.map(r => `<tr><td>${esc(r.sector)}</td><td>${pct(r.benchmark_weight)}</td>` + w.portfolios.map(n => `<td>${pct(r['target_' + n])}</td><td>${pct(r['actual_' + n])}</td>`).join('') + '</tr>').join('') + '</table>';
+  document.querySelector('#wnote').textContent = (w.benchmark ? w.benchmark_label + ': ' + w.benchmark.source + ' (Stand ' + w.benchmark.as_of + ', SHA-256 ' + w.benchmark.sha256.slice(0, 16) + '…). ' : 'Keine Benchmarkgewichte. ') + w.note + (w.signal ? ' Signal: ' + w.signal.signal_as_of + ', Kursstand ' + w.signal.price_session + ', Datenquelle ' + w.signal.origin : '') + ' Bewertungszeitpunkte: ' + JSON.stringify(w.actual_marked_at);
+  const head = '<tr><th>Name</th><th>Ticker</th><th>Sektor</th><th>Benchmark (SPY-Proxy)</th>' + w.portfolios.map(n => `<th>Ziel ${esc(n)}</th><th>Ist ${esc(n)}</th><th>Ist − Benchmark</th>`).join('') + '</tr>';
+  document.querySelector('#weights').innerHTML = '<table>' + head + w.rows.map(r => `<tr><td class="l">${esc(r.name || '–')}</td><td class="l">${esc(r.symbol)}</td><td class="l">${esc(r.sector)}</td><td>${pct(r.benchmark_weight)}</td>` + w.portfolios.map(n => `<td>${pct(r['target_' + n])}</td><td>${pct(r['actual_' + n])}</td><td>${pct(r['actual_active_' + n])}</td>`).join('') + '</tr>').join('') + '</table>';
+  const sectorHead = '<tr><th class="l">Sektor</th><th>Benchmark (SPY-Proxy)</th>' + w.portfolios.map(n => `<th>Ziel ${esc(n)}</th><th>Ist ${esc(n)}</th>`).join('') + '</tr>';
+  document.querySelector('#sectors').innerHTML = '<table>' + sectorHead + w.sectors.map(r => `<tr><td class="l">${esc(r.sector)}</td><td>${pct(r.benchmark_weight)}</td>` + w.portfolios.map(n => `<td>${pct(r['target_' + n])}</td><td>${pct(r['actual_' + n])}</td>`).join('') + '</tr>').join('') + '</table>';
+  const colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#9467bd', '#d62728', '#17becf', '#8c564b'];
+  const biggest = w.rows.filter(r => r.benchmark_weight != null).slice(0, 15);
+  const stockSeries = [{label: 'Benchmark (SPY-Proxy)', key: 'benchmark_weight', color: colors[0]}];
+  w.portfolios.forEach((n, i) => {
+    stockSeries.push({label: 'Ziel ' + n, key: 'target_' + n, color: colors[(2 * i + 1) % colors.length]});
+    stockSeries.push({label: 'Ist ' + n, key: 'actual_' + n, color: colors[(2 * i + 2) % colors.length]});
+  });
+  document.querySelector('#stock-bars').innerHTML = biggest.length ? biggest.map(r =>
+    `<div class="bar-group"><b>${esc(r.symbol)}</b>` + stockSeries.map(s => {
+      const value = r[s.key];
+      return value == null ? '' : `<div>${esc(s.label)} <span class="bar" style="width:${Math.max(0, Math.min(100, value * 100))}%;background:${s.color}"></span> ${pct(value)}</div>`;
+    }).join('') + '</div>').join('') : 'Keine Benchmarkwerte verfügbar.';
+  document.querySelector('#accounts').innerHTML = '<table><tr><th class="l">Depot</th><th>Bewertet am</th><th>NAV</th><th>Positionen</th><th>Cash</th><th>Dividendenforderungen</th></tr>' +
+    data.portfolio_accounts.map(a => `<tr><td class="l">${esc(a.portfolio_id)}</td><td>${esc(a.marked_at || '–')}</td><td>${a.nav == null ? '–' : Number(a.nav).toFixed(2)}</td><td>${a.positions_value == null ? '–' : Number(a.positions_value).toFixed(2)}</td><td>${a.cash == null ? '–' : Number(a.cash).toFixed(2)}</td><td>${a.dividend_receivables == null ? '–' : Number(a.dividend_receivables).toFixed(2)}</td></tr>`).join('') + '</table>';
+  const nav = data.nav_comparison;
+  document.querySelector('#nav-note').textContent = `Gemeinsamer tatsächlicher Start: ${nav.actual_common_start || 'noch keine gemeinsame Bewertung'}. ${nav.benchmark_label}`;
+  const points = nav.series;
+  if (points.length > 1) {
+    const keys = [...new Set(points.flatMap(p => Object.keys(p.portfolios)))];
+    const allValues = keys.flatMap(k => points.map(p => p.portfolios[k])).concat(points.map(p => p.spy_adj_close_proxy).filter(v => v != null));
+    const min = Math.min(...allValues), max = Math.max(...allValues), spread = max - min || 1;
+    const x = i => 20 + i * 920 / (points.length - 1);
+    const y = v => 280 - (v - min) * 250 / spread;
+    const lines = keys.map((k, i) => `<polyline fill="none" stroke="${colors[i % colors.length]}" stroke-width="2" points="${points.map((p, j) => `${x(j)},${y(p.portfolios[k])}`).join(' ')}"/>`).join('');
+    const proxy = points.every(p => p.spy_adj_close_proxy != null) ? `<polyline fill="none" stroke="#666" stroke-dasharray="5 4" stroke-width="2" points="${points.map((p, j) => `${x(j)},${y(p.spy_adj_close_proxy)}`).join(' ')}"/>` : '';
+    document.querySelector('#nav-chart').innerHTML = `<svg viewBox="0 0 960 310" role="img" aria-label="NAV-Vergleich">${lines}${proxy}</svg><p>${keys.map((k, i) => `<span style="color:${colors[i % colors.length]}">■ ${esc(k)}</span>`).join(' &nbsp; ')} &nbsp; <span style="color:#666">■ SPY adj_close Proxy</span></p>`;
+  } else {
+    document.querySelector('#nav-chart').textContent = 'Noch nicht genügend gemeinsame Tagesbewertungen.';
+  }
   document.querySelector('#cycles').textContent = JSON.stringify(data.cycles, null, 2);
   document.querySelector('#operations').textContent = JSON.stringify({
     latest_orders: data.latest_orders,
@@ -179,10 +302,13 @@ async function load() {
   }, null, 2);
 }
 load().catch(error => {
-  for (const id of ['status', 'cycles', 'operations', 'reports', 'weights', 'sectors']) {
+  for (const id of ['status', 'cycles', 'operations', 'reports', 'weights', 'sectors', 'stock-bars', 'accounts', 'nav-chart']) {
     document.querySelector(`#${id}`).textContent = `Dashboard-Fehler: ${error.message}`;
   }
 });
+setInterval(() => load().catch(error => {
+  document.querySelector('#banner').textContent = `Dashboard-Aktualisierung fehlgeschlagen: ${error.message}`;
+}), 60000);
 </script>
 </body>
 </html>
@@ -241,7 +367,7 @@ def dashboard_snapshot(database: str | Path, validation_manifest: str | Path | N
         marks_by_portfolio: dict[str, list[dict[str, Any]]] = {}
         for row in connection.execute(
             """SELECT portfolio_id, marked_at, cash, positions_value,
-                      dividend_receivables, nav, benchmark_value
+                      dividend_receivables, nav, benchmark_value, position_values_json
                FROM daily_marks ORDER BY portfolio_id, marked_at"""
         ):
             marks_by_portfolio.setdefault(row["portfolio_id"], []).append(dict(row))
@@ -264,6 +390,52 @@ def dashboard_snapshot(database: str | Path, validation_manifest: str | Path | N
             portfolio["drawdown"] = (
                 latest["nav"] / peak - 1.0 if latest is not None and peak else None
             )
+        tracked = [p for p in portfolios if p["strategy"] == "spy_buy_hold_v1"
+                   or p["strategy"] in {"equal_weight_v1", "mean_var_v1", "min_var_v1"}]
+        date_sets = [
+            {mark["marked_at"] for mark in p["daily_marks"]}
+            for p in tracked
+        ]
+        shared_dates = sorted(set.intersection(*date_sets)) if date_sets and all(date_sets) else []
+        nav_series: list[dict[str, Any]] = []
+        if shared_dates:
+            first_date = shared_dates[0]
+            base_marks = {
+                p["portfolio_id"]: next(mark for mark in p["daily_marks"] if mark["marked_at"] == first_date)
+                for p in tracked
+            }
+            for marked_at in shared_dates:
+                point: dict[str, Any] = {"marked_at": marked_at, "portfolios": {}}
+                for portfolio in tracked:
+                    mark = next(mark for mark in portfolio["daily_marks"] if mark["marked_at"] == marked_at)
+                    base_mark = base_marks[portfolio["portfolio_id"]]
+                    point["portfolios"][portfolio["portfolio_id"]] = mark["nav"] / base_mark["nav"]
+                proxy_source = next(
+                    (mark for portfolio in tracked for mark in portfolio["daily_marks"]
+                     if mark["marked_at"] == marked_at and mark["benchmark_value"] is not None),
+                    None,
+                )
+                base_proxy = next(
+                    (mark["benchmark_value"] for portfolio in tracked for mark in portfolio["daily_marks"]
+                     if mark["marked_at"] == first_date and mark["benchmark_value"] is not None),
+                    None,
+                )
+                point["spy_adj_close_proxy"] = (
+                    proxy_source["benchmark_value"] / base_proxy
+                    if proxy_source is not None and base_proxy else None
+                )
+                nav_series.append(point)
+        portfolio_accounts = [
+            {
+                "portfolio_id": portfolio["portfolio_id"],
+                "marked_at": (portfolio["latest_mark"] or {}).get("marked_at"),
+                "nav": (portfolio["latest_mark"] or {}).get("nav"),
+                "cash": (portfolio["latest_mark"] or {}).get("cash"),
+                "dividend_receivables": (portfolio["latest_mark"] or {}).get("dividend_receivables"),
+                "positions_value": (portfolio["latest_mark"] or {}).get("positions_value"),
+            }
+            for portfolio in portfolios
+        ]
 
         cycles = [
             dict(row) for row in connection.execute(
@@ -381,6 +553,13 @@ def dashboard_snapshot(database: str | Path, validation_manifest: str | Path | N
         "portfolios": portfolios,
         "report_status": report_status,
         "weight_comparison": weight_comparison,
+        "portfolio_accounts": portfolio_accounts,
+        "nav_comparison": {
+            "actual_common_start": nav_series[0]["marked_at"] if nav_series else None,
+            "series": nav_series,
+            "benchmark_label": "SPY-ETF-Proxy (adj_close), zusätzliche Referenz; primär ist das parallele SPY-Depot",
+        },
+        "automatic_refresh_seconds": 60,
         "cycles": cycles,
         "latest_orders": orders,
         "latest_jobs": jobs,

@@ -29,7 +29,8 @@ class RatiosWithoutIndustrialInputs(unittest.TestCase):
     def test_missing_revenue_and_shares_stay_nan_not_zero(self):
         index = pd.to_datetime(["2025-03-31", "2025-06-30", "2025-09-30", "2025-12-31", "2026-03-31"])
         fund = pd.DataFrame({"NetIncome": 10.0, "Assets": 1000.0, "StockholdersEquity": 100.0,
-                             "available_at": (index + pd.Timedelta(days=30)).strftime("%Y-%m-%d")}, index=index)
+                             "available_at": (index + pd.Timedelta(days=30)).strftime("%Y-%m-%dT12:00:00Z")},
+                            index=index)
         days = pd.bdate_range("2025-01-01", "2026-12-31")
         prices = pd.DataFrame({"close": 50.0, "adj_close": 50.0}, index=days)
         out = ra.compute_ratios(fund, prices, "BANK")
@@ -37,6 +38,30 @@ class RatiosWithoutIndustrialInputs(unittest.TestCase):
         self.assertTrue(out["X7_NPM"].isna().all())
         self.assertTrue(out["X6_PS"].isna().all())
         self.assertTrue((out["X3_ROA"] == 0.01).all())
+
+
+class DiagnosticOptimizerFailures(unittest.TestCase):
+    def test_insufficient_universe_is_reported_without_fabricated_optimized_weights(self):
+        tickers = [f"T{i}" for i in range(6)]
+        selected = pd.Series(np.linspace(0.01, 0.06, len(tickers)), index=tickers)
+        days = pd.bdate_range("2025-01-01", periods=253)
+        values = np.arange(len(days), dtype=float)
+        prices = pd.DataFrame({
+            ticker: 100 + values * (index + 1) / 100
+            for index, ticker in enumerate(tickers)
+        }, index=days)
+
+        weights, failures = pl._portfolio_weights(
+            selected, prices, days[-1], allow_optimizer_failures=True
+        )
+
+        self.assertEqual(set(weights), {"equal_weight_v1"})
+        self.assertAlmostEqual(float(weights["equal_weight_v1"].sum()), 0.30)
+        self.assertEqual(set(failures), {"mean_var_v1", "min_var_v1"})
+        self.assertTrue(all("requires at least 20 usable names" in reason
+                            for reason in failures.values()))
+        with self.assertRaisesRegex(pl.OptimizationError, "requires at least 20 usable names"):
+            pl._portfolio_weights(selected, prices, days[-1])
 
 
 class ReadinessRule(unittest.TestCase):

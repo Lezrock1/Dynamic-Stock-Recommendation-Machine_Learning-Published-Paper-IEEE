@@ -1,11 +1,18 @@
+import json
 import unittest
 import uuid
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest import mock
 
+import numpy as np
+import pandas as pd
+
+from pipeline import paper_live
 from pipeline.paper_dashboard import dashboard_snapshot
 from pipeline.paper_runner import (
-    CorporateAction, LockBusyError, PaperRunner, RunnerConfig, exclusive_lock,
+    CorporateAction, LockBusyError, OrderRequest, OrderSide, PaperRunner, RunnerConfig, exclusive_lock,
 )
 from pipeline.paper_store import PaperStore
 from pipeline.paper_synthetic import STRATEGIES, synthetic_adapters
@@ -84,9 +91,33 @@ class RunnerFlowTests(unittest.TestCase):
             self.assertTrue(portfolio["latest_mark"]["marked_at"].startswith("2026-01-08"))
             self.assertGreater(portfolio["latest_mark"]["positions_value"], 0)
             self.assertEqual(len(portfolio["positions"]), len(SYMBOLS))
+            mark_values = json.loads(portfolio["latest_mark"]["position_values_json"])
+            self.assertAlmostEqual(
+                sum(item["market_value"] for item in mark_values.values()),
+                portfolio["latest_mark"]["positions_value"],
+            )
+        equal_portfolio = next(p for p in snapshot["portfolios"] if p["portfolio_id"] == "equal_weight_v1")
+        self.assertEqual(
+            snapshot["weight_comparison"]["actual_marked_at"]["equal_weight_v1"],
+            equal_portfolio["latest_mark"]["marked_at"],
+        )
+        marked_values = json.loads(equal_portfolio["latest_mark"]["position_values_json"])
+        actual_rows = {row["symbol"]: row["actual_equal_weight_v1"]
+                       for row in snapshot["weight_comparison"]["rows"]}
+        for symbol, item in marked_values.items():
+            self.assertAlmostEqual(actual_rows[symbol], item["market_value"] / equal_portfolio["latest_mark"]["nav"])
         self.assertEqual({c["status"] for c in snapshot["cycles"]}, {"EXECUTED"})
         self.assertEqual(snapshot["historical_backtest_validation"]["status"], "NOT_VALIDATED")
         self.assertEqual(snapshot["live_paper_depot"]["data_origins"], ["SYNTHETIC_DEMO"])
+        self.assertEqual(
+            snapshot["nav_comparison"]["actual_common_start"],
+            equal_portfolio["daily_marks"][0]["marked_at"],
+        )
+        self.assertTrue(snapshot["nav_comparison"]["series"])
+        self.assertEqual(
+            snapshot["portfolio_accounts"][0]["marked_at"],
+            snapshot["portfolios"][0]["latest_mark"]["marked_at"],
+        )
 
         before = self.counts()
         restarted = self.runner()
@@ -117,6 +148,158 @@ class RunnerFlowTests(unittest.TestCase):
         self.assertEqual(self.counts()["signal_snapshots"], 0)
         self.assertEqual(self.counts()["execution_batches"], 0)
         self.assertTrue(PaperStore(self.database).query("SELECT 1 FROM job_errors"))
+
+    def test_resolved_special_case_needs_no_fabricated_filing_timestamp(self) -> None:
+        for key in KEYS[:-1]:
+            self.adapters.filings.arrive(key, "2026-01-05T12:00:00+00:00")
+        self.adapters.filings.resolutions = lambda: {
+            KEYS[-1]: {
+                "status": "CORPORATE_ACTION_RESOLVED",
+                "evidence": [{"source": "SEC Form 25", "effective_date": "2026-01-06"}],
+            }
+        }
+        self.now = utc("2026-01-06T15:00:00")
+        runner = self.runner()
+        runner.tick()
+
+        cycles = PaperStore(self.database).query(
+            "SELECT cycle_id FROM reporting_cycles WHERE cycle_key = '2025Q4'"
+        )
+        cycle_id = str(cycles[0]["cycle_id"])
+        special = PaperStore(self.database).query(
+            "SELECT filed_at, first_seen_at FROM expected_filings WHERE cycle_id = ? AND filing_key = ?",
+            (cycle_id, KEYS[-1]),
+        )[0]
+        self.assertIsNone(special["filed_at"])
+        self.assertIsNone(special["first_seen_at"])
+        timeline = PaperStore(self.database).query(
+            "SELECT published_at, first_seen_at, snapshot_as_of FROM cycle_timeline WHERE cycle_id = ?",
+            (cycle_id,),
+        )[0]
+        self.assertEqual(timeline["published_at"], "2026-01-05T12:00:00+00:00")
+        self.assertEqual(timeline["first_seen_at"], "2026-01-06T15:00:00+00:00")
+        self.assertEqual(timeline["snapshot_as_of"], "2026-01-06T15:00:00+00:00")
+        self.assertEqual(self.counts()["signal_snapshots"], 3 * len(SYMBOLS))
+
+    def test_current_reports_persist_one_shared_cycle_signal(self) -> None:
+        snapshot = "2026-12-15T20:00:00+00:00"
+        for key in KEYS:
+            self.adapters.filings.arrive(key, "2026-12-15T19:00:00+00:00")
+
+        config = {
+            "model": {"min_feature_coverage": 0.5, "first_trade_date_index": 0,
+                      "testing_windows": 1, "max_rolling_window_index": 10, "selection_quantile": 0.5},
+            "required_facts": [],
+            "report_matching_tolerance_days": 10,
+        }
+        provider = paper_live.ModelSignalProvider(config)
+        provider.prepare_cycle = lambda _: setattr(
+            provider, "expected_periods", {1: pd.Timestamp("2026-09-30"), 2: pd.Timestamp("2026-09-30")}
+        )
+        features = list(paper_live.FEATURES)
+        live_rows = []
+        for ticker, cik, available, tradedate in (
+            ("AAA", 1, "2026-10-20T20:00:00Z", "2026-12-01"),
+            ("BBB", 2, "2026-12-10T20:00:00Z", "2027-03-01"),
+        ):
+            row = {feature: 1.0 for feature in features}
+            row.update({
+                "tic": ticker, "cik": cik, "gsector": 10, "is_current": True,
+                "datadate": pd.Timestamp("2026-09-30"), "available_at": available,
+                "tradedate": pd.Timestamp(tradedate), "y_return": np.nan,
+                "signal_as_of": pd.Timestamp("2026-12-14T21:00:00Z"),
+                "signal_time": pd.Timestamp("2026-12-14T21:00:00Z"),
+                "label_known_at": pd.Timestamp("2026-12-14T21:00:00Z"),
+                "accession": f"acc-{ticker}", "published_at": available,
+            })
+            live_rows.append(row)
+        history = pd.DataFrame(live_rows)
+        historical = pd.DataFrame([{
+            "tic": "OLD", "tradedate": pd.Timestamp("2016-12-01"), "y_return": 0.01,
+            **{feature: 1.0 for feature in features},
+        }])
+        price_history = pd.DataFrame(
+            {"close": [100.0], "adj_close": [100.0]},
+            index=pd.DatetimeIndex([pd.Timestamp("2026-12-14")]),
+        )
+        weights = pd.Series({"AAA": 0.05, "BBB": 0.05})
+        universe = pd.DataFrame([
+            {"tic": "AAA", "cik": 1, "gsector": 10, "is_current": True},
+            {"tic": "BBB", "cik": 2, "gsector": 10, "is_current": True},
+        ])
+
+        def fake_model_run(data, feature_names, *args, **kwargs):
+            pending = pd.Timestamp(args[5][0])
+            self.assertEqual(
+                set(data.loc[data["tradedate"] == pending, "tic"]), {"AAA", "BBB"}
+            )
+            predictions = pd.DataFrame([[0.02, 0.03]], index=[pending], columns=["AAA", "BBB"])
+            model_names = pd.DataFrame({"model_name": ["fixture"]}, index=[pending])
+            return (None, None, None, None, predictions, model_names)
+
+        with (
+            mock.patch.object(paper_live.ua, "members_as_of", return_value=(universe, {})),
+            mock.patch.object(provider, "_live_rows", return_value=(history, {"AAA": price_history,
+                                                                             "BBB": price_history}, {})),
+            mock.patch.object(paper_live, "_historical_sector", return_value=historical),
+            mock.patch.object(paper_live, "sector_feature_set", return_value=["X1_REVGH"]),
+            mock.patch("ml_model.run_4model", side_effect=fake_model_run),
+            mock.patch.object(paper_live, "capped_equal_weights", return_value=weights),
+            mock.patch.object(paper_live, "optimize_weights", return_value=weights),
+        ):
+            self.adapters = replace(self.adapters, signals=provider)
+            self.now = utc(snapshot)
+            runner = self.runner()
+            runner.tick()
+
+        records = PaperStore(self.database).query(
+            "SELECT DISTINCT payload_json FROM signal_snapshots WHERE cycle_id = ?", (self.cycle_id,)
+        )
+        self.assertTrue(records)
+        persisted = [__import__("json").loads(str(row["payload_json"])) for row in records]
+        self.assertEqual({item["forecast"]["expected_return"] for item in persisted
+                         if item["forecast"] is not None}, {0.02, 0.03})
+        timeline = PaperStore(self.database).query(
+            "SELECT snapshot_as_of FROM cycle_timeline WHERE cycle_id = ?", (self.cycle_id,)
+        )[0]["snapshot_as_of"]
+        self.assertEqual(timeline, snapshot)
+
+    def test_dividend_pay_date_is_processed_after_all_positions_are_sold(self) -> None:
+        store = PaperStore(self.database)
+        store.create_portfolio("single", "Single", "single", 10_000.0)
+        buy_cycle = store.create_cycle("single", "buy", "single")
+        store.rebalance(
+            buy_cycle, "single", "buy-batch", {"AAA": 1.0},
+            [OrderRequest("buy-aaa", "AAA", OrderSide.BUY, 10)],
+        )
+        buy_order = store.orders_for_batch("buy-batch")[0]
+        store.record_fill("buy-fill", buy_order.order_id, 10, 100.0,
+                          transaction_cost_bps_per_side=0.0)
+        store.record_corporate_action(
+            "div-aaa", "single", "AAA", "dividend", "2026-01-08", 1.0, "fixture",
+            pay_date="2026-01-12", created_at="2026-01-08T21:00:00+00:00",
+        )
+        self.assertEqual(store.receivable_balance("single"), 10.0)
+
+        sell_cycle = store.create_cycle("single", "sell", "single")
+        store.rebalance(
+            sell_cycle, "single", "sell-batch", {"AAA": 0.0},
+            [OrderRequest("sell-aaa", "AAA", OrderSide.SELL, 10)],
+        )
+        sell_order = store.orders_for_batch("sell-batch")[0]
+        store.record_fill("sell-fill", sell_order.order_id, 10, 100.0,
+                          transaction_cost_bps_per_side=0.0)
+        self.assertEqual(store.position_balance("single", "AAA"), 0.0)
+        cash_before = store.cash_balance("single")
+
+        runner = PaperRunner(
+            store, synthetic_adapters(SYMBOLS), clock=lambda: utc("2026-01-12T22:00:00")
+        )
+        runner._apply_actions("2026-01-12")
+
+        self.assertEqual(store.receivable_balance("single"), 0.0)
+        self.assertEqual(store.cash_balance("single"), cash_before + 10.0)
+        self.assertEqual(store.query("SELECT status FROM dividend_receivables")[0]["status"], "PAID")
 
     def test_execution_waits_for_session_open_after_model_completion(self) -> None:
         for key in KEYS:

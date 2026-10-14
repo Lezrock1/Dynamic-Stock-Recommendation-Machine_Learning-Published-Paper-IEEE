@@ -1,3 +1,4 @@
+import json
 import sqlite3
 import unittest
 import uuid
@@ -87,6 +88,31 @@ class PaperStoreTests(unittest.TestCase):
         self.assertEqual(snapshot["portfolios"][0]["latest_mark"]["nav"], 10_000.0)
         self.assertEqual(snapshot["cycles"][0]["expected_count"], 1)
         self.assertEqual(snapshot["cycles"][0]["ready_count"], 0)
+
+    def test_daily_mark_persists_immutable_per_symbol_valuation(self) -> None:
+        store = self.new_store()
+        self.add_portfolio(store)
+        store.record_daily_mark(
+            "paper", "2026-01-02T21:00:00+00:00", 9_800, 200, 10_000, 125,
+            position_values={"AAA": (2, 100)},
+        )
+        with sqlite3.connect(self.database) as connection:
+            mark = connection.execute(
+                "SELECT position_values_json FROM daily_marks WHERE portfolio_id = 'paper'"
+            ).fetchone()
+            self.assertEqual(
+                json.loads(mark[0]),
+                {"AAA": {"market_value": 200.0, "price": 100.0, "quantity": 2.0}},
+            )
+            with self.assertRaises(sqlite3.IntegrityError):
+                connection.execute(
+                    "UPDATE daily_marks SET cash = 1 WHERE portfolio_id = 'paper'"
+                )
+        with self.assertRaisesRegex(PaperStoreError, "position marks must sum"):
+            store.record_daily_mark(
+                "paper", "2026-01-03T21:00:00+00:00", 9_800, 200, 10_000, 125,
+                position_values={"AAA": (1, 100)},
+            )
 
     def test_rebalance_is_idempotent_and_conflicting_batches_are_rejected(self) -> None:
         store = self.new_store()

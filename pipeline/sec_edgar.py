@@ -13,9 +13,9 @@ import pandas as pd
 import requests
 
 try:
-    from .market_calendar import first_available_session_after_filing
+    from .market_calendar import first_available_session_after_filing, session_close_time
 except ImportError:
-    from market_calendar import first_available_session_after_filing  # type: ignore[no-redef]
+    from market_calendar import first_available_session_after_filing, session_close_time  # type: ignore[no-redef]
 
 CACHE_DIR = Path(__file__).resolve().parent.parent / "cache" / "secfacts"
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -211,9 +211,10 @@ def point_in_time(cutoff, acceptance: dict):
 def _best_by_key(entries, key_fn, as_of=None):
     """Select the latest version that was available by the requested date.
 
-    SEC Company Facts contains amendments and comparative facts. A date-only
-    ``filed`` timestamp is conservatively usable beginning at the next NYSE
-    session; filtering happens before quarter/YTD derivations.
+    SEC Company Facts contains amendments and comparative facts. Under a point-in-time
+    cutoff, acceptance timestamps are checked against the full UTC cutoff regardless of
+    the filing-date calendar day. Without acceptance evidence, a fact is usable only
+    after the close of the next NYSE session.
     """
     cutoff = pd.Timestamp(as_of).normalize() if as_of is not None else None
     best = {}
@@ -221,17 +222,21 @@ def _best_by_key(entries, key_fn, as_of=None):
         filed = e.get("filed")
         if not filed:
             continue
-        available_at = first_available_session_after_filing(filed)
         if _POINT_IN_TIME is not None:
             pit_cutoff, acceptance = _POINT_IN_TIME
-            filed_day = pd.Timestamp(filed).normalize()
-            if filed_day >= pit_cutoff.tz_localize(None).normalize():
-                accepted = acceptance.get(e.get("accn", ""))
-                if accepted is None or accepted > pit_cutoff:
+            accepted = acceptance.get(e.get("accn", ""))
+            if accepted is not None:
+                if accepted > pit_cutoff:
                     continue
-            available_at = min(available_at, pit_cutoff.tz_localize(None).normalize())
-        elif cutoff is not None and available_at > cutoff:
-            continue
+                available_at = accepted
+            else:
+                available_at = session_close_time(first_available_session_after_filing(filed))
+                if available_at.tz_convert("UTC") > pit_cutoff:
+                    continue
+        else:
+            available_at = first_available_session_after_filing(filed)
+            if cutoff is not None and available_at > cutoff:
+                continue
         k = key_fn(e)
         candidate = {**e, "_available_at": available_at}
         rank = (e["filed"], e.get("accn", ""))
@@ -303,7 +308,10 @@ def _emit(series: dict, field: str, merged: dict) -> None:
     series[field] = {period: entry["val"] for period, entry in merged.items()}
     series[f"{field}_filed_at"] = {period: entry["filed"] for period, entry in merged.items()}
     series[f"{field}_available_at"] = {
-        period: entry["_available_at"].strftime("%Y-%m-%d") for period, entry in merged.items()}
+        period: (entry["_available_at"].tz_convert("UTC").isoformat()
+                 if entry["_available_at"].tzinfo is not None
+                 else entry["_available_at"].strftime("%Y-%m-%d"))
+        for period, entry in merged.items()}
     series[f"{field}_form"] = {period: entry.get("form", "") for period, entry in merged.items()}
     series[f"{field}_accn"] = {period: entry.get("accn", "") for period, entry in merged.items()}
     prov = {period: json.dumps(entry["_prov"], sort_keys=True)

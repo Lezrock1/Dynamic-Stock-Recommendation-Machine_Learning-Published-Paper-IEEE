@@ -25,7 +25,7 @@ try:
         first_session_on_or_after, nyse_sessions, previous_nyse_session, session_close_time,
     )
     from .paper_runner import (
-        Adapters, CorporateAction, FilingObservation, MissingDataError, SignalResult,
+        Adapters, CorporateAction, FilingObservation, MissingDataError, SignalResult, exclusive_lock,
     )
     from .paper_store import PaperStore, ValidationError
     from .portfolio_weights import OptimizationError, capped_equal_weights, optimize_weights
@@ -35,7 +35,7 @@ except ImportError:  # pragma: no cover - script execution
         first_session_on_or_after, nyse_sessions, previous_nyse_session, session_close_time,
     )
     from paper_runner import (  # type: ignore
-        Adapters, CorporateAction, FilingObservation, MissingDataError, SignalResult,
+        Adapters, CorporateAction, FilingObservation, MissingDataError, SignalResult, exclusive_lock,
     )
     from paper_store import PaperStore, ValidationError  # type: ignore
     from portfolio_weights import OptimizationError, capped_equal_weights, optimize_weights  # type: ignore
@@ -54,7 +54,7 @@ ANNUAL_PERIOD_TYPES = ("10-K", "10-Q")
 
 
 def load_config(path: str | Path | None = None) -> dict:
-    path = Path(path or os.getenv("PAPER_REAL_CONFIG") or DEFAULT_CONFIG)
+    path = Path(path or os.getenv("PAPER_REAL_CONFIG") or DEFAULT_CONFIG).expanduser().resolve()
     config = json.loads(path.read_text(encoding="utf-8"))
     if config.get("environment") != "real":
         raise ValidationError(f"{path} is not a real-environment configuration")
@@ -93,11 +93,32 @@ def _nominal_month_end(value: str) -> pd.Timestamp:
     return date + pd.offsets.MonthEnd(0)
 
 
-def expected_report(submissions: Mapping | None, quarter_end: pd.Timestamp) -> dict | None:
+PERIOD_RULE_V1 = "window-pm45d-v1"
+PERIOD_RULE_V2 = "calendar-quarter-v2"
+PERIOD_RULE_TOLERANCE_DAYS = 7
+
+
+def period_window(quarter_end: pd.Timestamp, rule: str = PERIOD_RULE_V2) -> tuple[pd.Timestamp, pd.Timestamp]:
+    """Exclusive lower and inclusive upper bound of period ends that belong to cycle ``quarter_end``.
+
+    v2: the reporting period ends inside the calendar quarter (previous quarter end, quarter end]; a 7-day
+    tolerance covers 52/53-week calendars. A period ending after the cycle date cannot be reported by it.
+    v1 (superseded): +-45 days around the quarter end, which assigned periods ending up to 45 days after it.
+    """
+    quarter_end = pd.Timestamp(quarter_end)
+    if rule == PERIOD_RULE_V1:
+        return quarter_end - pd.Timedelta(days=45), quarter_end + pd.Timedelta(days=45)
+    tolerance = pd.Timedelta(days=PERIOD_RULE_TOLERANCE_DAYS)
+    previous = (quarter_end - pd.offsets.MonthEnd(3)) if quarter_end.is_month_end else quarter_end - pd.DateOffset(months=3)
+    return previous + tolerance, quarter_end + tolerance
+
+
+def expected_report(submissions: Mapping | None, quarter_end: pd.Timestamp,
+                    rule: str = PERIOD_RULE_V2) -> dict | None:
     """Reporting period of one company that belongs to the calendar quarter ``quarter_end``.
 
     The company's own quarter grid is derived from its filed reports (period-end months);
-    the period within (quarter_end-45d, quarter_end+45d] is expected, as 10-K for the fiscal
+    the period inside the window of ``period_window`` is expected, as 10-K for the fiscal
     year-end month and as 10-Q otherwise. Returns None if no grid can be derived.
     """
     filings = _filings(submissions)
@@ -106,11 +127,11 @@ def expected_report(submissions: Mapping | None, quarter_end: pd.Timestamp) -> d
     recent = sorted(filings, key=lambda r: r["reportDate"], reverse=True)[:8]
     grid_months = {_nominal_month_end(r["reportDate"]).month % 3 for r in recent}
     if len(grid_months) != 1:
-        return _anniversary_report(filings, quarter_end)
+        return _anniversary_report(filings, quarter_end, rule)
     year_end_month = next((_nominal_month_end(r["reportDate"]).month for r in recent if r["form"] == "10-K"), None)
     if year_end_month is None:
         return None
-    low, high = quarter_end - pd.Timedelta(days=45), quarter_end + pd.Timedelta(days=45)
+    low, high = period_window(quarter_end, rule)
     reference = _nominal_month_end(recent[0]["reportDate"])
     for offset in range(-24, 25):
         candidate = _month_end(reference.year, reference.month) + pd.DateOffset(months=offset)
@@ -125,12 +146,12 @@ def expected_report(submissions: Mapping | None, quarter_end: pd.Timestamp) -> d
     return None
 
 
-def _anniversary_report(filings: list[dict], quarter_end: pd.Timestamp) -> dict | None:
+def _anniversary_report(filings: list[dict], quarter_end: pd.Timestamp, rule: str = PERIOD_RULE_V2) -> dict | None:
     """Off-grid fiscal calendars (e.g. 16-week first quarter): same period one year later.
 
     Needs a full prior fiscal year (one 10-K); otherwise the period is not derivable.
     """
-    low, high = quarter_end - pd.Timedelta(days=45), quarter_end + pd.Timedelta(days=45)
+    low, high = period_window(quarter_end, rule)
     if not any(r["form"] == "10-K" for r in filings):
         return None
     ordered = sorted(filings, key=lambda r: r["reportDate"], reverse=True)
@@ -245,7 +266,8 @@ def generate_expected_filings(config: Mapping[str, object], quarter_end: str,
         "quarter_end": quarter.date().isoformat(), "universe_as_of": as_of.date().isoformat(),
         "universe_evidence": universe_evidence, "universe_source": spec["source"],
         "universe_hash": digest, "rule": "company quarter grid from filed 10-Q/10-K period ends "
-        "(52/53-week calendars normalised); period within +-45 days of the calendar quarter end",
+        "(52/53-week calendars normalised); period ends inside the calendar quarter (rule " + PERIOD_RULE_V2 + ")",
+        "period_rule": PERIOD_RULE_V2,
         "exclusions": exclusions, "period_overrides_applied": applied_overrides,
         "succession_checks": succession_checks,
         "generated_at": datetime.now(timezone.utc).isoformat(), "expected": expected,
@@ -267,6 +289,179 @@ def write_manifest(config: Mapping[str, object], cycle_key: str, manifest: Mappi
         return path
     path.write_text(json.dumps(manifest, indent=2, sort_keys=True))
     return path
+
+
+PERIOD_CORRECTION_BLOCK_REASON = "PERIOD_CORRECTION_IN_PROGRESS"
+
+
+def _write_json_atomic(path: Path, payload: Mapping[str, object]) -> None:
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    os.replace(temporary, path)
+
+
+def _expected_by_company(manifest: Mapping[str, object]) -> dict[str, dict[str, object]]:
+    return {str(e["company_id"]): dict(e) for e in manifest["expected"]}
+
+
+def _expected_rows_match_manifest(store: PaperStore, cycle_ids: Sequence[str], manifest: Mapping[str, object]) -> bool:
+    expected = {
+        (str(item["company_id"]), str(item["filing_key"]), str(item["security_id"]),
+         str(item["expected_period"]), str(item["filing_type"]))
+        for item in manifest["expected"]
+    }
+    for cycle_id in cycle_ids:
+        rows = store.query(
+            "SELECT company_id, filing_key, security_id, expected_period, filing_type "
+            "FROM expected_filings WHERE cycle_id = ?",
+            (cycle_id,),
+        )
+        if {
+            (str(r["company_id"]), str(r["filing_key"]), str(r["security_id"]),
+             str(r["expected_period"]), str(r["filing_type"]))
+            for r in rows
+        } != expected:
+            return False
+    return True
+
+
+def _period_correction_plan(
+    cycle_key: str,
+    old: Mapping[str, object],
+    new: Mapping[str, object],
+    *,
+    old_bytes: bytes,
+) -> dict[str, object]:
+    old_by_cik = _expected_by_company(old)
+    new_by_cik = _expected_by_company(new)
+    if set(old_by_cik) != set(new_by_cik):
+        raise ValidationError("company set differs between old and corrected manifest: "
+                              f"{sorted(set(old_by_cik) ^ set(new_by_cik))[:10]}")
+    changes = [{"company_id": company_id, "security_id": new_by_cik[company_id]["security_id"],
+                "old": {k: old_by_cik[company_id][k] for k in ("filing_key", "expected_period", "filing_type")},
+                "new": {k: new_by_cik[company_id][k] for k in ("filing_key", "expected_period", "filing_type")}}
+               for company_id in sorted(old_by_cik)
+               if old_by_cik[company_id]["filing_key"] != new_by_cik[company_id]["filing_key"]]
+    return {
+        "cycle_key": cycle_key,
+        "old_rule": old.get("rule"),
+        "new_rule": new["rule"],
+        "old_manifest_sha256": hashlib.sha256(old_bytes).hexdigest(),
+        "changed": len(changes),
+        "reason": "v1 assigned periods ending up to 45 days AFTER the calendar quarter end (e.g. 2026-10-31); "
+                  "such a period cannot be reported at the cycle date",
+        "changes": changes,
+    }
+
+
+def _published_corrected_manifest(new_manifest: Mapping[str, object], audit: Mapping[str, object]) -> dict[str, object]:
+    manifest = dict(new_manifest)
+    manifest["supersedes"] = {
+        "manifest": f"{audit['cycle_key']}.{PERIOD_RULE_V1}.json",
+        "sha256": audit["old_manifest_sha256"],
+    }
+    return manifest
+
+
+def _publish_corrected_manifest(path: Path, new_manifest: Mapping[str, object], audit: Mapping[str, object]) -> None:
+    archive = path.with_name(f"{audit['cycle_key']}.{PERIOD_RULE_V1}.json")
+    if not archive.exists():
+        raise ValidationError(f"missing archived manifest required for correction: {archive}")
+    manifest = _published_corrected_manifest(new_manifest, audit)
+    manifest["supersedes"]["manifest"] = archive.name
+    _write_json_atomic(path, manifest)
+    _write_json_atomic(path.with_name(f"{audit['cycle_key']}.period_correction.json"), audit)
+
+
+def _assert_correction_cycles(connection: pd.io.sql.SQLiteDatabase | object, cycle_ids: Sequence[str]) -> None:
+    placeholders = ",".join("?" * len(cycle_ids))
+    rows = connection.execute(
+        f"SELECT cycle_id, status, blocked_reason, model_status, model_reason "
+        f"FROM reporting_cycles WHERE cycle_id IN ({placeholders})",
+        tuple(cycle_ids),
+    ).fetchall()
+    for row in rows:
+        if row["status"] not in {"OPEN", "BLOCKED"}:
+            raise ValidationError(f"cycle {row['cycle_id']} is already {row['status']}")
+        if row["status"] == "BLOCKED" and row["blocked_reason"] != PERIOD_CORRECTION_BLOCK_REASON:
+            raise ValidationError(f"cycle {row['cycle_id']} is blocked for another reason")
+        if row["model_status"] == "BLOCKED" and row["model_reason"] != PERIOD_CORRECTION_BLOCK_REASON:
+            raise ValidationError(f"cycle {row['cycle_id']} model is blocked for another reason")
+
+
+def _apply_expected_periods_to_db(
+    store: PaperStore,
+    cycle_ids: Sequence[str],
+    new_manifest: Mapping[str, object],
+) -> None:
+    by_company = _expected_by_company(new_manifest)
+    source_prefix = f"manifest:{new_manifest['universe_hash'][:16]}"
+    with store._connection() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        _assert_correction_cycles(connection, cycle_ids)
+        for cycle_id in cycle_ids:
+            connection.execute(
+                """UPDATE reporting_cycles
+                   SET status = 'BLOCKED', model_status = 'BLOCKED', model_reason = ?, blocked_reason = ?
+                   WHERE cycle_id = ?""",
+                (PERIOD_CORRECTION_BLOCK_REASON, PERIOD_CORRECTION_BLOCK_REASON, cycle_id),
+            )
+            rows = connection.execute(
+                "SELECT filing_key, company_id FROM expected_filings WHERE cycle_id = ?",
+                (cycle_id,),
+            ).fetchall()
+            for row in rows:
+                company_id = str(row["company_id"])
+                target = by_company.get(company_id)
+                if target is None:
+                    raise ValidationError(f"company {company_id} missing from corrected manifest")
+                if str(row["filing_key"]) == str(target["filing_key"]):
+                    continue
+                connection.execute(
+                    "DELETE FROM expected_filings WHERE cycle_id = ? AND filing_key = ?",
+                    (cycle_id, row["filing_key"]),
+                )
+                connection.execute(
+                    """INSERT INTO expected_filings
+                       (cycle_id, filing_key, company_id, security_id, expected_period, filing_type,
+                        source, status, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, 'WAITING_FILING', ?)""",
+                    (
+                        cycle_id, target["filing_key"], target["company_id"], target["security_id"],
+                        target["expected_period"], target["filing_type"],
+                        source_prefix + (f";{target['evidence']}" if target.get("evidence") else ""),
+                        datetime.now(timezone.utc).isoformat(),
+                    ),
+                )
+            PaperStore._refresh_filing_status(connection, cycle_id)
+        connection.execute("COMMIT")
+
+
+def _finalize_expected_period_correction(store: PaperStore, cycle_ids: Sequence[str]) -> None:
+    with store._connection() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        for cycle_id in cycle_ids:
+            PaperStore._refresh_filing_status(connection, cycle_id)
+            filing_status = connection.execute(
+                "SELECT filing_status FROM reporting_cycles WHERE cycle_id = ?",
+                (cycle_id,),
+            ).fetchone()["filing_status"]
+            connection.execute(
+                """UPDATE reporting_cycles
+                   SET status = 'OPEN',
+                       model_status = 'WAITING',
+                       model_reason = ?,
+                       blocked_reason = CASE WHEN blocked_reason = ? THEN NULL ELSE blocked_reason END
+                   WHERE cycle_id = ?""",
+                ("expected periods corrected; waiting for a fresh filing/model check",
+                 PERIOD_CORRECTION_BLOCK_REASON, cycle_id),
+            )
+            if filing_status == "READY":
+                connection.execute(
+                    "UPDATE reporting_cycles SET model_reason = ? WHERE cycle_id = ?",
+                    ("expected periods corrected; signal must be regenerated", cycle_id),
+                )
+        connection.execute("COMMIT")
 
 
 def create_real_cycle(store: PaperStore, config: Mapping[str, object], cycle_key: str,
@@ -293,6 +488,90 @@ def create_real_cycle(store: PaperStore, config: Mapping[str, object], cycle_key
             store.register_expected_filings(cycle_id, keys, filing_metadata=metadata)
         cycles[portfolio_id] = cycle_id
     return {"cycle_key": cycle_key, "expected_reports": len(keys), "manifest": str(path), "cycles": cycles}
+
+
+def correct_expected_periods(store: PaperStore, config: Mapping[str, object], cycle_key: str,
+                             quarter_end: str, apply: bool = False) -> dict[str, object]:
+    with exclusive_lock(store.path):
+        return _correct_expected_periods_locked(store, config, cycle_key, quarter_end, apply)
+
+
+def _correct_expected_periods_locked(store: PaperStore, config: Mapping[str, object], cycle_key: str,
+                                     quarter_end: str, apply: bool) -> dict[str, object]:
+    """Replace a frozen manifest made with the superseded period rule by one made with the current rule.
+
+    Allowed only while no signal snapshot or execution exists for the cycle. The old manifest is archived
+    unchanged, the company set must be identical, and every changed expectation is listed in an audit file.
+    Changed expectations restart as WAITING_FILING; unchanged rows (and filing resolutions) are untouched.
+    """
+    path = resolve_path(config, "manifest_dir") / f"{cycle_key}.json"
+    archive = path.with_name(f"{cycle_key}.{PERIOD_RULE_V1}.json")
+    audit_path = path.with_name(f"{cycle_key}.period_correction.json")
+    pending_path = path.with_name(f"{cycle_key}.period_correction.pending.json")
+    active = json.loads(path.read_text(encoding="utf-8"))
+    cycles = store.query("SELECT cycle_id FROM reporting_cycles WHERE cycle_key = ?", (cycle_key,))
+    ids = [c["cycle_id"] for c in cycles]
+    if not ids:
+        raise ValidationError(f"cycle not found: {cycle_key}")
+    busy = [t for t in ("data_snapshots", "execution_batches", "signal_snapshots")
+            if store.query(f"SELECT 1 FROM {t} WHERE cycle_id IN ({','.join('?' * len(ids))}) LIMIT 1", ids)]
+    if busy:
+        raise ValidationError(f"cycle {cycle_key} already has {busy}; periods can no longer be corrected")
+    with store._connection() as connection:
+        _assert_correction_cycles(connection, ids)
+    state = json.loads(pending_path.read_text(encoding="utf-8")) if pending_path.exists() else None
+    if state is None and active.get("period_rule") == PERIOD_RULE_V2 \
+            and _expected_rows_match_manifest(store, ids, active):
+        target_manifest = _published_corrected_manifest(active, {
+            "cycle_key": cycle_key,
+            "old_manifest_sha256": (active.get("supersedes") or {}).get("sha256", ""),
+        })
+        target_manifest["supersedes"]["manifest"] = archive.name
+        if (not archive.is_file() or not audit_path.is_file() or pending_path.exists()
+                or json.loads(path.read_text(encoding="utf-8")) != target_manifest):
+            raise ValidationError(
+                "period correction rows match, but archived evidence/publication is incomplete; "
+                "resume or inspect the correction artifacts"
+            )
+        return {"cycle_key": cycle_key, "changed": 0,
+                "note": "manifest, database, archive, and audit agree on " + PERIOD_RULE_V2}
+    if state is None:
+        if active.get("period_rule") == PERIOD_RULE_V2:
+            if not archive.exists() or not audit_path.exists():
+                raise ValidationError("manifest uses the corrected rule but database rows do not match and no "
+                                      "resumable correction state exists")
+            old = json.loads(archive.read_text(encoding="utf-8"))
+            new = active
+            old_bytes = archive.read_bytes()
+        else:
+            old = active
+            new = generate_expected_filings(config, quarter_end, old["universe_as_of"])
+            old_bytes = path.read_bytes()
+        audit = _period_correction_plan(cycle_key, old, new, old_bytes=old_bytes)
+        state = {"cycle_key": cycle_key, "cycle_ids": ids, "old_manifest": old, "new_manifest": new, "audit": audit}
+        if not apply:
+            return {**audit, "applied": False}
+        if not archive.exists():
+            archive.write_bytes(old_bytes)
+        _write_json_atomic(pending_path, state)
+    elif state.get("cycle_ids") != ids:
+        raise ValidationError(f"pending correction for {cycle_key} references different cycles; manual review needed")
+    if not apply:
+        return {**state["audit"], "applied": False, "pending": True}
+
+    target_manifest = _published_corrected_manifest(state["new_manifest"], state["audit"])
+    if not _expected_rows_match_manifest(store, ids, state["new_manifest"]):
+        _apply_expected_periods_to_db(store, ids, state["new_manifest"])
+    if json.loads(path.read_text(encoding="utf-8")) != target_manifest:
+        _publish_corrected_manifest(path, state["new_manifest"], state["audit"])
+    _finalize_expected_period_correction(store, ids)
+    if not _expected_rows_match_manifest(store, ids, state["new_manifest"]):
+        raise ValidationError("period correction incomplete: database rows still differ from manifest")
+    if json.loads(path.read_text(encoding="utf-8")) != target_manifest:
+        raise ValidationError("period correction incomplete: active manifest still differs from target")
+    if pending_path.exists():
+        pending_path.unlink()
+    return {**state["audit"], "applied": True}
 
 
 def required_facts_for(config: Mapping[str, object], gsector: int | None, cik: int | None = None) -> list[str]:
@@ -345,23 +624,72 @@ class SecFilingSource:
                 and abs((pd.Timestamp(f["reportDate"]) - period).days) <= self.tolerance]
         return min(hits, key=lambda f: f["acceptanceDateTime"]) if hits else None
 
-    def _facts_ready(self, cik: int, accession: str, required: Sequence[str] | None = None) -> bool:
+    def _facts_ready(
+        self,
+        cik: int,
+        accession: str,
+        required: Sequence[str] | None = None,
+        period_end: str | pd.Timestamp | None = None,
+    ) -> bool:
         facts = se.get_company_facts(cik, max_age_seconds=300)
         gaap = ((facts or {}).get("facts") or {}).get("us-gaap") or {}
         tags = {**se.DURATION_TAGS, **se.INSTANT_TAGS}
         names = self.required if required is None else required
-        fallback = None
+        fallback: dict[str, list[dict]] | None = None
+
+        def usable(
+            entry: Mapping[str, object],
+            unit: str,
+            provenance: Mapping[str, object] | None = None,
+        ) -> bool:
+            value = entry.get("val")
+            end = entry.get("end")
+            normalized_unit = unit.upper().split(":")[-1]
+            if (entry.get("accn") != accession or len(normalized_unit) != 3
+                    or not normalized_unit.isalpha() or value is None
+                    or isinstance(value, bool) or end is None):
+                return False
+            try:
+                numeric = float(value)
+                if not np.isfinite(numeric):
+                    return False
+                period_matches = (
+                    period_end is None
+                    or pd.Timestamp(end).normalize() == pd.Timestamp(period_end).normalize()
+                )
+                if provenance is None:
+                    return period_matches
+                context_id = provenance.get("context_id")
+                context_end = provenance.get("period_end")
+                return (period_matches and bool(context_id) and context_end is not None
+                        and (period_end is None or pd.Timestamp(context_end).normalize()
+                             == pd.Timestamp(period_end).normalize()))
+            except (TypeError, ValueError):
+                return False
+
         for name in names:
-            if any(e.get("accn") == accession
-                   for tag in tags[name] for units in (gaap.get(tag, {}).get("units") or {}).values()
-                   for e in units):
+            companyfacts_has_value = any(
+                usable(entry, unit)
+                for tag in tags[name]
+                for unit, entries in (gaap.get(tag, {}).get("units") or {}).items()
+                for entry in entries
+            )
+            if companyfacts_has_value:
                 continue
             # The original filing may already carry the fact although companyfacts does not (yet).
             if fallback is None:
                 fallback = ixf.fallback_entries(
                     cik, {**{f: (t, False) for f, t in se.DURATION_TAGS.items()},
                           **{f: (t, True) for f, t in se.INSTANT_TAGS.items()}}) if ixf.enabled_for(cik) else {}
-            if not any(e["accn"] == accession for e in fallback.get(name, [])):
+            fallback_has_value = False
+            for entry in fallback.get(name, []):
+                provenance = entry.get("_prov")
+                if isinstance(provenance, Mapping) and usable(
+                    entry, str(provenance.get("unit") or ""), provenance
+                ):
+                    fallback_has_value = True
+                    break
+            if not fallback_has_value:
                 return False
         return True
 
@@ -375,7 +703,8 @@ class SecFilingSource:
             if match is None:
                 continue
             accepted = pd.Timestamp(match["acceptanceDateTime"]).tz_convert("UTC").isoformat()
-            ready = self._facts_ready(cik, match["accessionNumber"], self._required_for(cik))
+            ready = self._facts_ready(cik, match["accessionNumber"], self._required_for(cik),
+                                      match["reportDate"])
             result[item["filing_key"]] = FilingObservation(
                 True, ready, True, accepted, f"sec:{match['accessionNumber']}",
                 None if ready else "report accepted; required XBRL facts not yet in companyfacts",
@@ -533,6 +862,33 @@ def _add_historical_timing(frame: pd.DataFrame, following: pd.Timestamp) -> pd.D
     return frame
 
 
+def _portfolio_weights(
+    selected: pd.Series,
+    panel: pd.DataFrame,
+    price_session: pd.Timestamp,
+    allow_optimizer_failures: bool = False,
+) -> tuple[dict[str, pd.Series], dict[str, str]]:
+    if not allow_optimizer_failures:
+        return ({
+            "equal_weight_v1": capped_equal_weights(selected.index.tolist()),
+            "mean_var_v1": optimize_weights(selected, panel, price_session, fallback_to_equal=False),
+            "min_var_v1": optimize_weights(
+                selected, panel, price_session, minimum_variance=True, fallback_to_equal=False
+            ),
+        }, {})
+    weights = {"equal_weight_v1": capped_equal_weights(selected.index.tolist())}
+    failures: dict[str, str] = {}
+    for name, minimum_variance in (("mean_var_v1", False), ("min_var_v1", True)):
+        try:
+            weights[name] = optimize_weights(
+                selected, panel, price_session, minimum_variance=minimum_variance,
+                fallback_to_equal=False,
+            )
+        except OptimizationError as exc:
+            failures[name] = str(exc)
+    return weights, failures
+
+
 class ModelSignalProvider:
     """``predict_as_of``: point-in-time panel -> sector models -> top quantile -> three weightings."""
 
@@ -544,6 +900,7 @@ class ModelSignalProvider:
         self.expected_periods: dict[int, pd.Timestamp] = {}
         # Diagnostic runs may rank every ticker with a pending row; production only trades eligible ones.
         self.enforce_eligibility = True
+        self.allow_diagnostic_optimizer_failures = False
 
     def prepare_cycle(self, cycle_key: str) -> None:
         """Use the universe frozen in the cycle manifest, not the (later) snapshot date."""
@@ -573,6 +930,51 @@ class ModelSignalProvider:
         if abs((pd.Timestamp(used["datadate"]) - expected).days) > tolerance:
             return False, "PERIOD_NOT_CURRENT_CYCLE"
         return True, "OK"
+
+    def _align_cycle_reports(
+        self,
+        live: pd.DataFrame,
+        cik_by_tic: Mapping[str, int],
+        price_session: pd.Timestamp,
+        snapshot: pd.Timestamp,
+    ) -> tuple[pd.DataFrame, pd.Timestamp]:
+        """Put each latest, available expected-period report into one shared prediction slot.
+
+        `compute_ratios` assigns live rows to historical fixed quarterly execution dates. Those dates
+        are useful for backtest labels, but an already-passed slot must not discard a current-cycle
+        report. The current report rows are therefore aligned to one next slot after the shared snapshot.
+        """
+        aligned = live.copy()
+        if aligned.empty:
+            raise MissingDataError("no live rows are available for the cycle")
+        cutoff = snapshot.tz_convert("UTC") if snapshot.tzinfo is not None else snapshot.tz_localize("UTC")
+        available = pd.to_datetime(aligned["available_at"], errors="coerce", utc=True)
+        period_ends = pd.to_datetime(aligned["datadate"], errors="coerce").dt.normalize()
+        candidates: list[tuple[str, int, pd.Timestamp]] = []
+        tolerance = int(self.config.get("report_matching_tolerance_days", 10))
+        for ticker, indices in aligned.groupby("tic").groups.items():
+            cik = cik_by_tic.get(str(ticker))
+            expected = self.expected_periods.get(cik) if cik is not None else None
+            if expected is None:
+                continue
+            idx = list(indices)
+            delta = (period_ends.loc[idx] - expected.normalize()).dt.days.abs()
+            valid = (delta <= tolerance) & available.loc[idx].le(cutoff)
+            eligible_indices = [index for index, ok in zip(idx, valid, strict=True) if bool(ok)]
+            if eligible_indices:
+                latest = max(eligible_indices, key=lambda index: (available.loc[index], period_ends.loc[index]))
+                candidates.append((str(ticker), latest, pd.Timestamp(aligned.loc[latest, "tradedate"])))
+        if not candidates:
+            raise MissingDataError("no expected-period report was available by the common snapshot")
+
+        pending_candidates = [trade_date for _, _, trade_date in candidates if trade_date > price_session]
+        if pending_candidates:
+            pending = min(pending_candidates)
+        else:
+            pending = ra._next_rebalance_date(cutoff.tz_localize(None).normalize())
+        for _, index, _ in candidates:
+            aligned.loc[index, "tradedate"] = pending
+        return aligned, pd.Timestamp(pending)
 
     def _live_rows(self, universe: pd.DataFrame, snapshot: pd.Timestamp,
                    price_session: pd.Timestamp) -> tuple[pd.DataFrame, dict[str, pd.DataFrame], dict[str, str]]:
@@ -634,15 +1036,12 @@ class ModelSignalProvider:
         universe = universe.drop_duplicates("tic").assign(cik=lambda f: f["cik"].astype(int))
         live, prices_by_tic, skipped = self._live_rows(universe, snapshot, price_session)
 
-        pending_candidates = live.loc[live["tradedate"] > price_session, "tradedate"]
-        if pending_candidates.empty:
-            raise MissingDataError("no pending trade date can be derived from the available reports")
-        pending = pending_candidates.min()
+        cik_by_tic = {str(t): int(c) for t, c in zip(universe["tic"], universe["cik"])}
+        live, pending = self._align_cycle_reports(live, cik_by_tic, price_session, snapshot)
         live = live[live["tradedate"] <= pending]
 
         forecasts: dict[str, dict[str, object]] = {}
         forecast_records: list[dict[str, object]] = []
-        cik_by_tic = {str(t): int(c) for t, c in zip(universe["tic"], universe["cik"])}
         selected_parts, sector_models, sector_counts, sector_feature_sets = [], {}, {}, {}
         for sector, sector_live in live.groupby("gsector"):
             sector = int(sector)
@@ -719,12 +1118,10 @@ class ModelSignalProvider:
                           axis=1).sort_index()
         panel = panel.loc[:price_session]
         try:
-            weights = {
-                "equal_weight_v1": capped_equal_weights(selected.index.tolist()),
-                "mean_var_v1": optimize_weights(selected, panel, price_session, fallback_to_equal=False),
-                "min_var_v1": optimize_weights(selected, panel, price_session, minimum_variance=True,
-                                               fallback_to_equal=False),
-            }
+            weights, optimization_failures = _portfolio_weights(
+                selected, panel, price_session,
+                allow_optimizer_failures=self.allow_diagnostic_optimizer_failures,
+            )
         except OptimizationError as exc:
             raise MissingDataError(f"portfolio optimisation failed: {exc}") from exc
         for name, series in weights.items():
@@ -745,6 +1142,11 @@ class ModelSignalProvider:
                 "sector_features": sector_feature_sets, "sector_models": sector_models,
                 "sector_counts": sector_counts, "forecast_records": forecast_records,
                 "eligibility_enforced": self.enforce_eligibility,
+                "portfolio_optimisation": {
+                    "status": "PARTIAL_DIAGNOSTIC" if optimization_failures else "COMPLETE",
+                    "failures": optimization_failures,
+                    "not_production_weights": self.allow_diagnostic_optimizer_failures,
+                },
             },
             forecasts=forecasts,
             target_weights={n: {t: float(w) for t, w in s.items() if w > 1e-9} for n, s in weights.items()},

@@ -44,7 +44,8 @@ class SyntheticSignals:
         return SignalResult(
             signal_as_of=signal_as_of,
             sector_as_of={f"sector_{i}": signal_as_of for i in range(self.sectors)},
-            data_snapshot={"origin": SYNTHETIC_ORIGIN, "symbols": len(self.symbols)},
+            data_snapshot={"origin": SYNTHETIC_ORIGIN, "symbols": len(self.symbols),
+                           "eligibility_enforced": True},
             forecasts={s: {"expected_return": 0.01} for s in self.symbols},
             target_weights={name: {s: weight for s in self.symbols} for name in STRATEGIES},
         )

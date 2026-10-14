@@ -32,6 +32,20 @@ YAHOO_TO_GICS = {
 _TICKER = re.compile(r"^[A-Z][A-Z0-9.\-]{0,5}$")
 
 
+SECTOR_LOOKUP_CACHE = Path(__file__).resolve().parent.parent / "cache" / "universe_sector_lookup.json"
+
+
+def _yahoo_sector_code(ticker: str) -> int | None:
+    """Yahoo sector -> GICS code, stored on first lookup so later (offline) runs read identical values."""
+    store = json.loads(SECTOR_LOOKUP_CACHE.read_text()) if SECTOR_LOOKUP_CACHE.exists() else {}
+    if ticker not in store:
+        import yfinance as yf
+        store[ticker] = {"yahoo_sector": str(yf.Ticker(ticker).info.get("sector")),
+                         "looked_up_at": pd.Timestamp.now(tz="UTC").isoformat()}
+        SECTOR_LOOKUP_CACHE.write_text(json.dumps(store, indent=1, sort_keys=True))
+    return YAHOO_TO_GICS.get(store[ticker]["yahoo_sector"])
+
+
 def fetch_changes_wikitext(max_age_seconds: float = 6 * 3600) -> str:
     if CACHE.exists() and time.time() - CACHE.stat().st_mtime < max_age_seconds:
         return json.loads(CACHE.read_text())["wikitext"]
@@ -74,21 +88,26 @@ def members_as_of(as_of: str | pd.Timestamp) -> tuple[pd.DataFrame, dict]:
     current = universe[universe["is_current"].astype(bool)].copy()
     wikitext = fetch_changes_wikitext()
     changes = parse_changes(wikitext)
-    later = changes[changes["date"] > day]
+    later = changes[changes["date"] > day].sort_values("date", ascending=False, kind="stable")
     added_after = {t for t in later["added"] if t}
-    removed_after = {t for t in later["removed"] if t}
-
-    keep = current[~current["tic"].isin(added_after)].copy()
+    current_tickers = set(current["tic"])
     dated_after = current[pd.to_datetime(current["date_added"], errors="coerce") > day]["tic"]
     unexplained = sorted(set(dated_after) - added_after)
     if unexplained:
         raise ValueError(f"members added after {day.date()} without a change record: {unexplained}")
-    keep = keep[~keep["tic"].isin(dated_after)]
+
+    historical_tickers = set(current_tickers)
+    for change in later.itertuples(index=False):
+        if change.added:
+            historical_tickers.discard(change.added)
+        if change.removed:
+            historical_tickers.add(change.removed)
+    keep = current[current["tic"].isin(historical_tickers)].copy()
 
     restored, unmapped = [], []
     sec_map = uv._get_sec_ticker_map()
     former = universe[~universe["is_current"].astype(bool)].set_index("tic")
-    for ticker in sorted(removed_after - set(keep["tic"])):
+    for ticker in sorted(historical_tickers - set(keep["tic"])):
         if ticker in former.index:
             row = former.loc[ticker]
             restored.append({**row.to_dict(), "tic": ticker, "is_current": True,
@@ -108,8 +127,7 @@ def members_as_of(as_of: str | pd.Timestamp) -> tuple[pd.DataFrame, dict]:
             if info is None:
                 continue
             if match.empty:
-                import yfinance as yf
-                code = YAHOO_TO_GICS.get(str(yf.Ticker(ticker).info.get("sector")))
+                code = _yahoo_sector_code(ticker)
                 source = "restored_from_change_log;sector=yahoo_mapped_approximation"
             else:
                 code, source = int(match["gsector"].mode().iloc[0]), "restored_from_change_log"
@@ -128,7 +146,7 @@ def members_as_of(as_of: str | pd.Timestamp) -> tuple[pd.DataFrame, dict]:
         "as_of": day.date().isoformat(),
         "change_log": CHANGES_API,
         "change_log_sha256": hashlib.sha256(wikitext.encode()).hexdigest(),
-        "reversed_additions": sorted(added_after & set(current["tic"])),
+        "reversed_additions": sorted((added_after & current_tickers) - historical_tickers),
         "restored_removals": sorted(r["tic"] for r in restored),
         "member_count": int(len(result)),
     }

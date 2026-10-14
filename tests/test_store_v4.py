@@ -11,7 +11,7 @@ from pipeline.paper_store import (
 REAL_DB = Path(__file__).parents[1] / "state" / "real_paper.sqlite3"
 
 
-class V4StoreTests(unittest.TestCase):
+class StoreMigrationTests(unittest.TestCase):
     def setUp(self) -> None:
         self.dir = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, self.dir, True)
@@ -68,8 +68,8 @@ class V4StoreTests(unittest.TestCase):
         version = con.execute("PRAGMA user_version").fetchone()[0]
         con.close()
         result = PaperStore.migrate(copy, "real", self.dir / "bk")
-        self.assertEqual(result["to_version"], 4)
-        if version < 4:
+        self.assertEqual(result["to_version"], 5)
+        if version < 5:
             self.assertTrue(Path(result["backup"]).exists())
         con = sqlite3.connect(copy)
         after = con.execute("SELECT portfolio_id, created_at FROM portfolios ORDER BY 1").fetchall()

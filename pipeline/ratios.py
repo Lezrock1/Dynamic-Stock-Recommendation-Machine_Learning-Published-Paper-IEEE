@@ -27,7 +27,10 @@ REBALANCE_MONTHS = [3, 6, 9, 12]
 
 def _next_rebalance_date(available_date: pd.Timestamp) -> pd.Timestamp:
     """First fixed quarterly execution date whose prior-session cutoff includes data."""
-    available_date = pd.Timestamp(available_date).normalize()
+    available_date = pd.Timestamp(available_date)
+    if available_date.tzinfo is not None:
+        available_date = available_date.tz_convert("UTC").tz_localize(None)
+    available_date = available_date.normalize()
     for year_offset in range(3):
         year = available_date.year + year_offset
         for month in REBALANCE_MONTHS:
@@ -136,7 +139,7 @@ def compute_ratios(
         shares = shares.where(shares.notna(), implied)
     df["SharesOutstanding"] = shares
 
-    available_at = pd.to_datetime(df["available_at"], errors="coerce")
+    available_at = pd.to_datetime(df["available_at"], errors="coerce", utc=True)
     if available_at.isna().any():
         raise ValueError("fundamental rows contain missing or invalid availability dates")
     if filing_lag_days:

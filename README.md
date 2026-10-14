@@ -289,6 +289,7 @@ The orchestrator only starts the model after 100 % readiness; the dry run above 
 purpose and wrote nothing to the database. The scheduler (`scheduler` command) is documented but has not
 been started as a permanent service.
 
+The [.env.example](.env.example) file can also be used as a reference. It is not loaded automatically, and no API credentials are required.
 
 ### Model-coverage changes (2026-10-14, readiness rule v2)
 Diagnosis: `python pipeline/model_coverage.py diagnose|readiness|model-run --cycle-key 2026Q3`
@@ -320,6 +321,7 @@ Causes found and fixed (with regression tests in `tests/test_model_coverage.py`)
 
 Historical backtest validation remains `NOT_VALIDATED` (no hashed evidence manifest).
 
+The complete pipeline downloads data, builds tables, trains the models, and generates reports:
 
 ### Implemented state (2026-10-14, schema v4, readiness rule v3)
 Status: **real-data diagnosis and integration verified up to the readiness gate; no signal, no orders (0), scheduler and automatic rebalancing NOT enabled; historical validation `NOT_VALIDATED`.**

@@ -20,7 +20,7 @@ from typing import Iterator, Mapping, Sequence
 
 
 _APPLICATION_ID = 0x50535452
-_SCHEMA_VERSION = 5
+_SCHEMA_VERSION = 6
 ENVIRONMENTS = ("real", "synthetic", "test")
 _V3_STATEMENTS = (
     """CREATE TABLE IF NOT EXISTS store_meta (
@@ -78,6 +78,7 @@ _V5_STATEMENTS = (
         BEFORE DELETE ON daily_marks
         BEGIN SELECT RAISE(ABORT, 'daily marks are immutable'); END""",
 )
+_V6_STATEMENTS = ()
 _SCHEMA_TABLES = {
     "filing_resolutions",
     "dividend_pay_dates",
@@ -298,6 +299,7 @@ class PaperStore:
                     first_seen_at TEXT,
                     source TEXT NOT NULL DEFAULT '',
                     error_reason TEXT NOT NULL DEFAULT '',
+                    facts_ready_at TEXT,
                     status TEXT NOT NULL DEFAULT 'WAITING_FILING'
                         CHECK(status IN
                             ('WAITING_FILING', 'WAITING_FACTS', 'INVALID_DATA', 'READY')),
@@ -495,7 +497,7 @@ class PaperStore:
                     BEFORE DELETE ON job_errors
                     BEGIN SELECT RAISE(ABORT, 'job errors are append-only'); END""",
             )
-            for statement in statements + _V3_STATEMENTS + _V4_STATEMENTS + _V5_STATEMENTS:
+            for statement in statements + _V3_STATEMENTS + _V4_STATEMENTS + _V5_STATEMENTS + _V6_STATEMENTS:
                 connection.execute(statement)
             connection.execute(
                 "INSERT INTO store_meta (key, value) VALUES ('environment', ?)", (environment,)
@@ -615,6 +617,14 @@ class PaperStore:
                     if "position_values_json" not in columns:
                         connection.execute("ALTER TABLE daily_marks ADD COLUMN position_values_json TEXT")
                     for statement in _V5_STATEMENTS:
+                        connection.execute(statement)
+                if version < 6:
+                    columns = {
+                        row[1] for row in connection.execute("PRAGMA table_info(expected_filings)")
+                    }
+                    if "facts_ready_at" not in columns:
+                        connection.execute("ALTER TABLE expected_filings ADD COLUMN facts_ready_at TEXT")
+                    for statement in _V6_STATEMENTS:
                         connection.execute(statement)
                 connection.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
                 connection.commit()
@@ -895,6 +905,7 @@ class PaperStore:
         first_seen_at: str | None = None,
         source: str | None = None,
         error_reason: str | None = None,
+        facts_ready_at: str | None = None,
         updated_at: str | None = None,
     ) -> FilingStatus:
         cycle_id = _identifier(cycle_id, "cycle_id")
@@ -913,6 +924,9 @@ class PaperStore:
         if facts_ready and not received:
             raise ValidationError("structured facts cannot be ready before a filing is received")
         updated_at = _timestamp(updated_at)
+        facts_ready_at = _timestamp(facts_ready_at) if facts_ready_at is not None else (
+            updated_at if facts_ready else None
+        )
         status = _filing_status(received, facts_ready, valid)
         filed_at = _timestamp(filed_at) if filed_at is not None else None
         first_seen_at = _timestamp(first_seen_at) if first_seen_at is not None else None
@@ -924,12 +938,14 @@ class PaperStore:
                    SET received = ?, facts_ready = ?, valid = ?, status = ?, updated_at = ?,
                        filed_at = COALESCE(?, filed_at),
                        first_seen_at = COALESCE(?, first_seen_at),
+                       facts_ready_at = CASE WHEN ? THEN COALESCE(facts_ready_at, ?) ELSE facts_ready_at END,
                        source = COALESCE(?, source),
                        error_reason = COALESCE(?, error_reason)
                    WHERE cycle_id = ? AND filing_key = ?""",
                 (
                     received, facts_ready, valid, status.value, updated_at,
-                    filed_at, first_seen_at, source, error_reason, cycle_id, filing_key,
+                    filed_at, first_seen_at, facts_ready, facts_ready_at,
+                    source, error_reason, cycle_id, filing_key,
                 ),
             )
             if cursor.rowcount != 1:

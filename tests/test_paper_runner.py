@@ -12,7 +12,8 @@ import pandas as pd
 from pipeline import paper_live
 from pipeline.paper_dashboard import dashboard_snapshot
 from pipeline.paper_runner import (
-    CorporateAction, LockBusyError, OrderRequest, OrderSide, PaperRunner, RunnerConfig, exclusive_lock,
+    CorporateAction, FilingObservation, LockBusyError, OrderRequest, OrderSide, PaperRunner, RunnerConfig,
+    exclusive_lock,
 )
 from pipeline.paper_store import PaperStore
 from pipeline.paper_synthetic import STRATEGIES, synthetic_adapters
@@ -148,6 +149,87 @@ class RunnerFlowTests(unittest.TestCase):
         self.assertEqual(self.counts()["signal_snapshots"], 0)
         self.assertEqual(self.counts()["execution_batches"], 0)
         self.assertTrue(PaperStore(self.database).query("SELECT 1 FROM job_errors"))
+
+    def test_signal_snapshot_waits_until_last_facts_become_ready(self) -> None:
+        delayed_key = KEYS[-1]
+        self.adapters.filings.arrive(delayed_key, "2026-01-06T12:00:00+00:00")
+        for key in KEYS[:-1]:
+            self.adapters.filings.arrive(key, "2026-01-06T12:00:00+00:00")
+        ready = {"delayed": False}
+
+        def observe(expected):
+            return {
+                item["filing_key"]: FilingObservation(
+                    True, item["filing_key"] != delayed_key or ready["delayed"], True,
+                    "2026-01-06T12:00:00+00:00", "fixture",
+                )
+                for item in expected if item["filing_key"] in self.adapters.filings.arrived
+            }
+
+        self.adapters.filings.observe = observe
+        self.now = utc("2026-01-06T15:00:00")
+        runner = self.runner()
+        cycle_id = str(runner._cycles("2025Q4")[0]["cycle_id"])
+        first_tick = runner.tick()
+        self.assertEqual(self.adapters.signals.calls, [])
+        delayed = PaperStore(self.database).query(
+            "SELECT filed_at, first_seen_at, facts_ready_at FROM expected_filings "
+            "WHERE cycle_id = ? AND filing_key = ?", (cycle_id, delayed_key),
+        )[0]
+        self.assertEqual(delayed["filed_at"], "2026-01-06T12:00:00+00:00", first_tick)
+        self.assertEqual(delayed["first_seen_at"], "2026-01-06T15:00:00+00:00")
+        self.assertIsNone(delayed["facts_ready_at"])
+
+        ready["delayed"] = True
+        self.now = utc("2026-01-08T15:00:00")
+        runner.tick()
+        timeline = PaperStore(self.database).query(
+            "SELECT snapshot_as_of FROM cycle_timeline WHERE cycle_id = ?", (cycle_id,)
+        )[0]["snapshot_as_of"]
+        self.assertEqual(timeline, "2026-01-08T15:00:00+00:00")
+        self.assertEqual(self.adapters.signals.calls, ["2026-01-08T15:00:00+00:00"])
+        delayed = PaperStore(self.database).query(
+            "SELECT facts_ready_at FROM expected_filings WHERE cycle_id = ? AND filing_key = ?",
+            (cycle_id, delayed_key),
+        )[0]
+        self.assertEqual(delayed["facts_ready_at"], "2026-01-08T15:00:00+00:00")
+
+    def test_legacy_ready_filing_without_facts_timestamp_is_rechecked_not_backfilled(self) -> None:
+        key = KEYS[-1]
+        self.adapters.filings.arrive(key, "2026-01-05T12:00:00+00:00")
+        store = PaperStore(self.database)
+        cycles = store.query("SELECT cycle_id FROM reporting_cycles")
+        for cycle in cycles:
+            store.set_filing_result(
+                cycle["cycle_id"],
+                key,
+                received=True,
+                facts_ready=True,
+                valid=True,
+                filed_at="2026-01-05T12:00:00+00:00",
+                first_seen_at="2026-01-05T13:00:00+00:00",
+                source="synthetic:legacy-fixture",
+                facts_ready_at="2026-01-05T13:00:00+00:00",
+                updated_at="2026-01-05T13:00:00+00:00",
+            )
+        with store._connection() as connection:
+            connection.execute(
+                "UPDATE expected_filings SET facts_ready_at = NULL WHERE filing_key = ?", (key,)
+            )
+
+        result = self.runner().check_filings("2025Q4")
+
+        self.assertEqual(result["status"], "SUCCEEDED")
+        rows = store.query(
+            "SELECT filed_at, first_seen_at, facts_ready_at FROM expected_filings WHERE filing_key = ?",
+            (key,),
+        )
+        self.assertEqual(len(rows), len(cycles))
+        self.assertEqual(
+            {(r["filed_at"], r["first_seen_at"], r["facts_ready_at"]) for r in rows},
+            {("2026-01-05T12:00:00+00:00", "2026-01-05T13:00:00+00:00",
+              "2026-01-05T16:00:00+00:00")},
+        )
 
     def test_resolved_special_case_needs_no_fabricated_filing_timestamp(self) -> None:
         for key in KEYS[:-1]:
@@ -375,6 +457,31 @@ class RunnerFlowTests(unittest.TestCase):
         with exclusive_lock(self.database):
             with self.assertRaises(LockBusyError):
                 self.runner().tick()
+
+    def test_tick_runs_injected_maintenance_and_persists_refresh_attempt_once_per_day(self) -> None:
+        refresh_calls = []
+        prepare_calls = []
+        runner = PaperRunner(
+            PaperStore(self.database),
+            self.adapters,
+            clock=lambda: self.now,
+            data_refresher=lambda: (refresh_calls.append(self.now.date().isoformat()) or {"status": "FRESH"}),
+            cycle_preparer=lambda: (prepare_calls.append(self.now.date().isoformat())
+                                    or {"status": "WAITING_FOR_PREDECESSOR"}),
+        )
+
+        first = runner.tick()
+        second = runner.tick()
+
+        self.assertEqual(first["data_refresh"]["job_status"], "SUCCEEDED")
+        self.assertEqual(first["data_refresh"]["result"]["status"], "FRESH")
+        self.assertEqual(second["data_refresh"]["job_status"], "DONE")
+        self.assertEqual(refresh_calls, ["2026-01-05"])
+        self.assertEqual(prepare_calls, ["2026-01-05", "2026-01-05"])
+        refresh_jobs = PaperStore(self.database).query(
+            "SELECT run_id FROM job_runs WHERE job_type = 'data_refresh' AND status = 'SUCCEEDED'"
+        )
+        self.assertEqual(len(refresh_jobs), 1)
 
 
 if __name__ == "__main__":

@@ -4,10 +4,12 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import re
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 import sqlite3
 from typing import Any
+from urllib.parse import parse_qs, urlsplit
 
 try:
     from .paper_store import PaperStore
@@ -84,8 +86,18 @@ def _weight_comparison(connection: sqlite3.Connection, environment: str, report_
         "WHERE snapshot_id LIKE 'model:%' ORDER BY captured_at DESC LIMIT 1").fetchone()
     benchmark = benchmark_weights.latest() if environment == "real" else None
     result: dict[str, Any] = {
-        "benchmark": ({"source": benchmark["source_url"], "as_of": benchmark["as_of"], "sha256": benchmark["sha256"],
-                       "kind": benchmark["kind"], "symbol_aliases": {}} if benchmark else None),
+        "benchmark": ({
+            "source": benchmark["source_url"],
+            "as_of": benchmark["as_of"],
+            "sha256": benchmark["sha256"],
+            "kind": benchmark["kind"],
+            "fetched_at": benchmark.get("fetched_at"),
+            "total_weight": benchmark.get("sum"),
+            "equity_weight_sum": benchmark.get("equity_weight_sum"),
+            "non_equity_weight_sum": benchmark.get("non_equity_weight_sum"),
+            "non_equity_positions": benchmark.get("non_equity_positions", []),
+            "symbol_aliases": {},
+        } if benchmark else None),
         "signal": None, "rows": [], "sectors": [], "diagnostic": False, "actual_marked_at": {},
         "banner": "Kein gültiges ML-Signal gespeichert: keine Zielgewichte vorhanden." if not signal else None}
     payload = json.loads(signal["payload_json"]) if signal else {}
@@ -210,109 +222,17 @@ REQUIRED_EVIDENCE = (
 )
 REQUIRED_HASHES = ("raw_prices", "targets", "corporate_actions", "benchmark_values", "benchmark_metadata")
 
-_HTML = """<!doctype html>
-<html lang="de">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Paper-Depot</title>
-<style>
-body{font:16px system-ui,sans-serif;max-width:1250px;margin:2rem auto;padding:0 1rem;background:#f4f6f8;color:#15202b}
-h1{margin-bottom:.25rem}.muted{color:#52606d}.card{background:white;border:1px solid #d8e0e8;border-radius:10px;padding:1rem;margin:1rem 0}
-table{border-collapse:collapse;font-size:13px;width:100%}td,th{border:1px solid #d8e0e8;padding:4px 6px;text-align:right}td:first-child,th:first-child,td.l{text-align:left}pre{white-space:pre-wrap;overflow-wrap:anywhere;margin:0}.warn{color:#8a3b00;font-weight:600}
-.bar-group{padding:.4rem 0;border-bottom:1px solid #edf0f3;font-size:12px}.bar{display:inline-block;height:10px;max-width:55%;margin:0 .25rem}
-#nav-chart svg{width:100%;height:310px;border-bottom:1px solid #d8e0e8}#nav-chart p{font-size:12px}
-</style>
-</head>
-<body>
-<h1>Virtuelles Paper-Depot</h1>
-<p id="banner" class="warn"></p>
-<p id="refresh" class="muted">Nur simulierte Buchungen. Keine Brokerorders.</p>
-<section class="card"><h2>Status</h2><pre id="status">Lade lokalen Depotstatus …</pre></section>
-<section class="card"><h2>Berichtsbereitschaft</h2><div id="reports">Lade …</div></section>
-<section class="card"><h2>Gewichtsvergleich je Aktie</h2><p id="wbanner" class="warn"></p><p id="wnote" class="muted"></p><div id="weights">Lade …</div></section>
-<section class="card"><h2>Größte Titel: Benchmark, Ziel und Ist</h2><div id="stock-bars"></div></section>
-<section class="card"><h2>Sektorvergleich</h2><div id="sectors">Lade …</div></section>
-<section class="card"><h2>Vermögenswerte, Cash und Dividendenforderungen</h2><div id="accounts"></div></section>
-<section class="card"><h2>NAV-Verlauf ab gemeinsamem tatsächlichem Start</h2><p id="nav-note" class="muted"></p><div id="nav-chart"></div></section>
-<section class="card"><h2>Berichte & Zyklen</h2><pre id="cycles">Lade …</pre></section>
-<section class="card"><h2>Aufträge & letzte Läufe</h2><pre id="operations">Lade …</pre></section>
-<script>
-async function load() {
-  const response = await fetch('/api/status', {cache: 'no-store'});
-  if (!response.ok) throw new Error(`HTTP ${response.status}`);
-  const data = await response.json();
-  document.querySelector('#banner').textContent = data.environment + ': ' + data.data_banner;
-  document.querySelector('#status').textContent = JSON.stringify({
-    cycle_timelines: data.cycle_timelines,
-    historical_backtest_validation: data.historical_backtest_validation,
-    live_paper_depot: data.live_paper_depot,
-    portfolios: data.portfolios,
-    valuation_quality: data.valuation_quality,
-    benchmark_and_model_data: 'Not asserted by the local ledger; inspect stored manifests.'
-  }, null, 2);
-  const pct = v => v == null ? '–' : (100 * v).toFixed(2) + ' %';
-  const esc = t => String(t).replace(/[&<>]/g, c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;'}[c]));
-  document.querySelector('#refresh').textContent =
-    `Nur simulierte Buchungen. Keine Brokerorders. Automatische Anzeigeaktualisierung alle ${data.automatic_refresh_seconds} Sekunden; Stand ${new Date().toLocaleString()}.`;
-  const rs = data.report_status;
-  document.querySelector('#reports').innerHTML = rs ? `<p>Erwartet: ${rs.expected} | <b>READY: ${rs.ready}</b> | belegte Sonderfälle (nicht READY): ${rs.special_cases.length} | offen: ${rs.open} (WAITING_FACTS ${rs.status_groups.WAITING_FACTS} + WAITING_FILING ${rs.status_groups.WAITING_FILING} + INVALID_DATA ${rs.status_groups.INVALID_DATA}) | Summe: ${rs.status_groups_sum} | Gate erfüllt: ${rs.gate_satisfied ? 'ja' : 'nein'}</p>` +
-    '<h3>Belegte Sonderfälle</h3><pre>' + esc(JSON.stringify(rs.special_cases, null, 1)) + '</pre><h3>Offene Berichte</h3><pre>' + esc(rs.open_cases.map(c => c.company_id + ' ' + c.expected_period + ' ' + c.status).join('\\n')) + '</pre>' : 'Kein Zyklus.';
-  const w = data.weight_comparison;
-  document.querySelector('#wbanner').textContent = w.banner || '';
-  document.querySelector('#wnote').textContent = (w.benchmark ? w.benchmark_label + ': ' + w.benchmark.source + ' (Stand ' + w.benchmark.as_of + ', SHA-256 ' + w.benchmark.sha256.slice(0, 16) + '…). ' : 'Keine Benchmarkgewichte. ') + w.note + (w.signal ? ' Signal: ' + w.signal.signal_as_of + ', Kursstand ' + w.signal.price_session + ', Datenquelle ' + w.signal.origin : '') + ' Bewertungszeitpunkte: ' + JSON.stringify(w.actual_marked_at);
-  const head = '<tr><th>Name</th><th>Ticker</th><th>Sektor</th><th>Benchmark (SPY-Proxy)</th>' + w.portfolios.map(n => `<th>Ziel ${esc(n)}</th><th>Ist ${esc(n)}</th><th>Ist − Benchmark</th>`).join('') + '</tr>';
-  document.querySelector('#weights').innerHTML = '<table>' + head + w.rows.map(r => `<tr><td class="l">${esc(r.name || '–')}</td><td class="l">${esc(r.symbol)}</td><td class="l">${esc(r.sector)}</td><td>${pct(r.benchmark_weight)}</td>` + w.portfolios.map(n => `<td>${pct(r['target_' + n])}</td><td>${pct(r['actual_' + n])}</td><td>${pct(r['actual_active_' + n])}</td>`).join('') + '</tr>').join('') + '</table>';
-  const sectorHead = '<tr><th class="l">Sektor</th><th>Benchmark (SPY-Proxy)</th>' + w.portfolios.map(n => `<th>Ziel ${esc(n)}</th><th>Ist ${esc(n)}</th>`).join('') + '</tr>';
-  document.querySelector('#sectors').innerHTML = '<table>' + sectorHead + w.sectors.map(r => `<tr><td class="l">${esc(r.sector)}</td><td>${pct(r.benchmark_weight)}</td>` + w.portfolios.map(n => `<td>${pct(r['target_' + n])}</td><td>${pct(r['actual_' + n])}</td>`).join('') + '</tr>').join('') + '</table>';
-  const colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#9467bd', '#d62728', '#17becf', '#8c564b'];
-  const biggest = w.rows.filter(r => r.benchmark_weight != null).slice(0, 15);
-  const stockSeries = [{label: 'Benchmark (SPY-Proxy)', key: 'benchmark_weight', color: colors[0]}];
-  w.portfolios.forEach((n, i) => {
-    stockSeries.push({label: 'Ziel ' + n, key: 'target_' + n, color: colors[(2 * i + 1) % colors.length]});
-    stockSeries.push({label: 'Ist ' + n, key: 'actual_' + n, color: colors[(2 * i + 2) % colors.length]});
-  });
-  document.querySelector('#stock-bars').innerHTML = biggest.length ? biggest.map(r =>
-    `<div class="bar-group"><b>${esc(r.symbol)}</b>` + stockSeries.map(s => {
-      const value = r[s.key];
-      return value == null ? '' : `<div>${esc(s.label)} <span class="bar" style="width:${Math.max(0, Math.min(100, value * 100))}%;background:${s.color}"></span> ${pct(value)}</div>`;
-    }).join('') + '</div>').join('') : 'Keine Benchmarkwerte verfügbar.';
-  document.querySelector('#accounts').innerHTML = '<table><tr><th class="l">Depot</th><th>Bewertet am</th><th>NAV</th><th>Positionen</th><th>Cash</th><th>Dividendenforderungen</th></tr>' +
-    data.portfolio_accounts.map(a => `<tr><td class="l">${esc(a.portfolio_id)}</td><td>${esc(a.marked_at || '–')}</td><td>${a.nav == null ? '–' : Number(a.nav).toFixed(2)}</td><td>${a.positions_value == null ? '–' : Number(a.positions_value).toFixed(2)}</td><td>${a.cash == null ? '–' : Number(a.cash).toFixed(2)}</td><td>${a.dividend_receivables == null ? '–' : Number(a.dividend_receivables).toFixed(2)}</td></tr>`).join('') + '</table>';
-  const nav = data.nav_comparison;
-  document.querySelector('#nav-note').textContent = `Gemeinsamer tatsächlicher Start: ${nav.actual_common_start || 'noch keine gemeinsame Bewertung'}. ${nav.benchmark_label}`;
-  const points = nav.series;
-  if (points.length > 1) {
-    const keys = [...new Set(points.flatMap(p => Object.keys(p.portfolios)))];
-    const allValues = keys.flatMap(k => points.map(p => p.portfolios[k])).concat(points.map(p => p.spy_adj_close_proxy).filter(v => v != null));
-    const min = Math.min(...allValues), max = Math.max(...allValues), spread = max - min || 1;
-    const x = i => 20 + i * 920 / (points.length - 1);
-    const y = v => 280 - (v - min) * 250 / spread;
-    const lines = keys.map((k, i) => `<polyline fill="none" stroke="${colors[i % colors.length]}" stroke-width="2" points="${points.map((p, j) => `${x(j)},${y(p.portfolios[k])}`).join(' ')}"/>`).join('');
-    const proxy = points.every(p => p.spy_adj_close_proxy != null) ? `<polyline fill="none" stroke="#666" stroke-dasharray="5 4" stroke-width="2" points="${points.map((p, j) => `${x(j)},${y(p.spy_adj_close_proxy)}`).join(' ')}"/>` : '';
-    document.querySelector('#nav-chart').innerHTML = `<svg viewBox="0 0 960 310" role="img" aria-label="NAV-Vergleich">${lines}${proxy}</svg><p>${keys.map((k, i) => `<span style="color:${colors[i % colors.length]}">■ ${esc(k)}</span>`).join(' &nbsp; ')} &nbsp; <span style="color:#666">■ SPY adj_close Proxy</span></p>`;
-  } else {
-    document.querySelector('#nav-chart').textContent = 'Noch nicht genügend gemeinsame Tagesbewertungen.';
-  }
-  document.querySelector('#cycles').textContent = JSON.stringify(data.cycles, null, 2);
-  document.querySelector('#operations').textContent = JSON.stringify({
-    latest_orders: data.latest_orders,
-    latest_jobs: data.latest_jobs,
-    latest_errors: data.latest_errors
-  }, null, 2);
-}
-load().catch(error => {
-  for (const id of ['status', 'cycles', 'operations', 'reports', 'weights', 'sectors', 'stock-bars', 'accounts', 'nav-chart']) {
-    document.querySelector(`#${id}`).textContent = `Dashboard-Fehler: ${error.message}`;
-  }
-});
-setInterval(() => load().catch(error => {
-  document.querySelector('#banner').textContent = `Dashboard-Aktualisierung fehlgeschlagen: ${error.message}`;
-}), 60000);
-</script>
-</body>
-</html>
-"""
+try:
+    from .dashboard_view import (
+        HTML as _HTML, enhance_snapshot as _enhance_dashboard_snapshot, diagnostic_file,
+        target_package_download,
+    )
+except ImportError:
+    from dashboard_view import (
+        HTML as _HTML, enhance_snapshot as _enhance_dashboard_snapshot, diagnostic_file,
+        target_package_download,
+    )
+
 
 
 def evaluate_backtest_validation(manifest: str | Path | None) -> dict[str, str]:
@@ -576,18 +496,61 @@ class _DashboardHandler(BaseHTTPRequestHandler):
     validation_manifest: Path | None = None
 
     def do_GET(self) -> None:
-        if self.path == "/":
+        request = urlsplit(self.path)
+        if request.path == "/":
             body = _HTML.encode("utf-8")
             content_type = "text/html; charset=utf-8"
-        elif self.path == "/api/status":
+        elif request.path == "/api/status":
+            query = parse_qs(request.query, keep_blank_values=True)
+            cycle_values = query.get("cycle_key", [])
+            if len(cycle_values) > 1 or (
+                cycle_values and cycle_values[0] and not re.fullmatch(r"\d{4}Q[1-4]", cycle_values[0])
+            ):
+                self.send_error(400, "invalid cycle_key")
+                return
+            cycle_key = cycle_values[0] if cycle_values and cycle_values[0] else None
             body = json.dumps(
-                dashboard_snapshot(self.database, self.validation_manifest), ensure_ascii=False, default=str
+                _enhance_dashboard_snapshot(
+                    dashboard_snapshot(self.database, self.validation_manifest),
+                    Path(__file__).resolve().parent.parent,
+                    cycle_key,
+                ),
+                ensure_ascii=False,
+                default=str,
             ).encode("utf-8")
             content_type = "application/json; charset=utf-8"
-        elif self.path == "/api/health":
+        elif request.path == "/api/health":
             PaperStore(self.database)
             body = b'{"status":"ok"}'
             content_type = "application/json; charset=utf-8"
+        elif request.path == "/api/diagnostic-download":
+            query = parse_qs(request.query)
+            names = query.get("name", [])
+            if len(names) != 1 or set(query) != {"name"}:
+                self.send_error(400, "exactly one artifact name required")
+                return
+            try:
+                path = diagnostic_file(Path(__file__).resolve().parent.parent, names[0])
+                body = path.read_bytes()
+            except (OSError, ValueError, KeyError, TypeError):
+                self.send_error(404, "verified diagnostic artifact unavailable")
+                return
+            content_type = "text/csv; charset=utf-8" if path.suffix == ".csv" else "application/json; charset=utf-8"
+        elif request.path == "/api/target-download":
+            query = parse_qs(request.query)
+            if set(query) != {"package", "name"} or any(len(values) != 1 for values in query.values()):
+                self.send_error(400, "exactly one package and artifact name required")
+                return
+            name = query["name"][0]
+            try:
+                body = target_package_download(
+                    Path(__file__).resolve().parent.parent, query["package"][0], name)
+            except (OSError, ValueError, KeyError, TypeError):
+                self.send_error(404, "verified target artifact unavailable")
+                return
+            content_type = ("text/csv; charset=utf-8" if name.endswith(".csv") else
+                            "text/plain; charset=utf-8" if name.endswith(".md") else
+                            "application/json; charset=utf-8")
         else:
             self.send_error(404)
             return

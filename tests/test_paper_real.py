@@ -9,12 +9,13 @@ from pathlib import Path
 import sqlite3
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from unittest import mock
 
 import numpy as np
 import pandas as pd
 
-from pipeline import paper_dashboard, paper_live, portfolio_weights, sec_edgar, universe_asof
+from pipeline import benchmark_weights, paper_dashboard, paper_live, portfolio_weights, sec_edgar, universe_asof
 from pipeline.paper_dashboard import dashboard_snapshot, evaluate_backtest_validation
 from pipeline.paper_portfolio import run_cli
 from pipeline.paper_store import PaperStore, ValidationError
@@ -50,7 +51,9 @@ class MigrationTests(unittest.TestCase):
             self.assertEqual(migrated.environment(), "real")
             self.assertEqual(migrated.cash_balance("equal_weight"), before)
             with sqlite3.connect(database) as migrated_connection:
-                self.assertEqual(migrated_connection.execute("PRAGMA user_version").fetchone()[0], 5)
+                self.assertEqual(migrated_connection.execute("PRAGMA user_version").fetchone()[0], 6)
+                columns = {r[1] for r in migrated_connection.execute("PRAGMA table_info(expected_filings)")}
+                self.assertIn("facts_ready_at", columns)
             again = PaperStore.migrate(database, "real", root / "backups")
             self.assertFalse(again["migrated"])
             self.assertEqual(len(list((root / "backups").iterdir())), 1)
@@ -74,6 +77,116 @@ class SeparationTests(unittest.TestCase):
                              "NOT_VALIDATED")
             self.assertIn("SYNTHETIC", dashboard_snapshot(synthetic)["data_banner"])
             self.assertIn("REAL", dashboard_snapshot(real)["data_banner"])
+
+
+class CyclePreparationTests(unittest.TestCase):
+    def test_next_cycle_waits_for_complete_predecessor_and_is_idempotent(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = PaperStore.create(root / "real.sqlite3", "real")
+            for portfolio_id, strategy in paper_live.STRATEGY_IDS.items():
+                store.create_portfolio(portfolio_id, portfolio_id, strategy, 1000.0)
+            config = {"manifest_dir": str(root / "manifests")}
+
+            def manifest(_config, quarter_end, _universe_as_of=None):
+                quarter = (int(quarter_end[5:7]) - 1) // 3 + 1
+                key = f"{quarter_end[:4]}Q{quarter}"
+                return {
+                    "quarter_end": quarter_end,
+                    "universe_as_of": quarter_end,
+                    "universe_hash": key,
+                    "period_rule": paper_live.PERIOD_RULE_V2,
+                    "expected": [{
+                        "filing_key": f"company-{key}",
+                        "company_id": "company",
+                        "security_id": "123",
+                        "expected_period": quarter_end,
+                        "filing_type": "10-Q",
+                    }],
+                }
+
+            with mock.patch.object(paper_live, "generate_expected_filings", side_effect=manifest):
+                first = paper_live.prepare_next_real_cycle(
+                    store, config, datetime(2026, 10, 15, tzinfo=timezone.utc)
+                )
+                self.assertEqual(first["status"], "PREPARED")
+                self.assertEqual(first["cycle_key"], "2026Q3")
+                repeated = paper_live.prepare_next_real_cycle(
+                    store, config, datetime(2026, 10, 15, tzinfo=timezone.utc)
+                )
+                self.assertEqual(repeated["status"], "WAITING_FOR_PREDECESSOR")
+                self.assertEqual(len(store.query("SELECT cycle_id FROM reporting_cycles")), 4)
+
+                for row in store.query("SELECT cycle_id FROM reporting_cycles WHERE cycle_key = '2026Q3'"):
+                    store.set_cycle_status(row["cycle_id"], "SIGNALLED")
+                    store.set_cycle_status(row["cycle_id"], "EXECUTED")
+                next_cycle = paper_live.prepare_next_real_cycle(
+                    store, config, datetime(2026, 10, 15, tzinfo=timezone.utc)
+                )
+                self.assertEqual(next_cycle["status"], "PREPARED")
+                self.assertEqual(next_cycle["cycle_key"], "2026Q4")
+                paper_live.prepare_next_real_cycle(
+                    store, config, datetime(2026, 10, 15, tzinfo=timezone.utc)
+                )
+                self.assertEqual(len(store.query("SELECT cycle_id FROM reporting_cycles")), 8)
+
+
+class BenchmarkHoldingsTests(unittest.TestCase):
+    def test_parse_separates_equity_cash_and_other_without_normalizing(self) -> None:
+        rows = [[None] * 8 for _ in range(8)]
+        rows[2][1] = "As of 13-Oct-2026"
+        rows[5] = ["Name", "Ticker", "Identifier", "SEDOL", "Weight", "Sector",
+                   "Shares Held", "Local Currency"]
+        rows[6] = ["EXAMPLE INC", "EXM", "123", "ABC", 40.0, "Technology", 100, "USD"]
+        rows[7] = ["US DOLLAR", "-", "999USD", "", 0.5, "-", 1000, "USD"]
+        rows.append(["WARRANT", "EXM/WS", "456", "", 0.1, "-", 10, "USD"])
+        content = io.BytesIO()
+        pd.DataFrame(rows).to_excel(content, header=False, index=False)
+
+        result = benchmark_weights.parse_holdings(content.getvalue())
+
+        self.assertEqual(result["weights"], {"EXM": 0.4})
+        self.assertAlmostEqual(result["equity_weight_sum"], 0.4)
+        self.assertAlmostEqual(result["non_equity_weight_sum"], 0.006)
+        self.assertAlmostEqual(result["sum"], 0.406)
+        self.assertEqual({row["ticker"] for row in result["non_equity_positions"]}, {"-", "EXM/WS"})
+
+    def test_holdings_refresh_reuses_fresh_snapshot_and_retries_stale_snapshot(self) -> None:
+        now = datetime(2026, 10, 15, 12, tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            old = {
+                "as_of": "2026-10-13",
+                "fetched_at": "2026-10-15T11:00:00+00:00",
+                "weights": {"AAA": 0.6, "-": 0.01},
+                "sum": 0.61,
+            }
+            (root / "spy_holdings_2026-10-13.json").write_text(json.dumps(old))
+            with mock.patch.object(benchmark_weights, "fetch") as fetch:
+                reused = benchmark_weights.fetch_if_stale(root, now=now)
+            fetch.assert_not_called()
+            self.assertEqual(reused["weights"], {"AAA": 0.6})
+            self.assertAlmostEqual(reused["non_equity_weight_sum"], 0.01)
+
+            old["fetched_at"] = "2026-10-13T11:00:00+00:00"
+            (root / "spy_holdings_2026-10-13.json").write_text(json.dumps(old))
+
+            def publish(destination):
+                updated = {
+                    "as_of": "2026-10-15",
+                    "fetched_at": now.isoformat(),
+                    "weights": {"AAA": 0.59},
+                    "sum": 0.59,
+                    "equity_weight_sum": 0.59,
+                    "non_equity_weight_sum": 0.0,
+                    "non_equity_positions": [],
+                }
+                (destination / "spy_holdings_2026-10-15.json").write_text(json.dumps(updated))
+
+            with mock.patch.object(benchmark_weights, "fetch", side_effect=publish) as fetch:
+                refreshed = benchmark_weights.fetch_if_stale(root, now=now)
+            fetch.assert_called_once_with(root)
+            self.assertEqual(refreshed["as_of"], "2026-10-15")
 
 
 class BacktestValidationTests(unittest.TestCase):
@@ -188,7 +301,8 @@ class DashboardProjectionTests(unittest.TestCase):
         }
         connection.execute("INSERT INTO data_snapshots VALUES (?, ?, ?)",
                            ("model:test", "2026-10-14T12:00:00+00:00", json.dumps(payload)))
-        with mock.patch.object(paper_dashboard.benchmark_weights, "latest", return_value=None):
+        with mock.patch.object(paper_dashboard.benchmark_weights, "latest", return_value=None), \
+                mock.patch.object(paper_dashboard, "_universe_metadata", return_value=({}, {})):
             result = paper_dashboard._weight_comparison(
                 connection, "synthetic", None,
                 [{"portfolio_id": "equal_weight", "strategy": "equal_weight",
@@ -236,6 +350,15 @@ class WeightTests(unittest.TestCase):
 
 class ExpectedReportTests(unittest.TestCase):
     q = pd.Timestamp("2026-09-30")
+
+    def test_calendar_quarter_window_boundaries_include_only_seven_day_tolerance(self) -> None:
+        lower, upper = paper_live.period_window(self.q)
+        self.assertEqual(lower, pd.Timestamp("2026-07-07"))
+        self.assertEqual(upper, pd.Timestamp("2026-10-07"))
+        self.assertFalse(lower < pd.Timestamp("2026-07-07") <= upper)
+        self.assertTrue(lower < pd.Timestamp("2026-07-08") <= upper)
+        self.assertTrue(lower < pd.Timestamp("2026-10-07") <= upper)
+        self.assertFalse(lower < pd.Timestamp("2026-10-08") <= upper)
 
     def test_52_53_week_calendar_maps_to_nominal_quarters(self) -> None:
         sub = filings(("10-Q", "2026-07-03"), ("10-Q", "2026-04-03"), ("10-K", "2025-12-31"),
@@ -479,6 +602,21 @@ class PeriodCorrectionTests(unittest.TestCase):
                 )
         self.assertFalse((self.root / "2026Q3.period_correction.pending.json").exists())
 
+    def test_period_correction_refuses_a_signal_that_started_before_it(self) -> None:
+        self.store.record_signal_snapshot(
+            self.cycle_id, "equal_weight_v1", "AAA", {"weight": 1.0},
+            created_at="2026-10-14T12:00:00+00:00",
+        )
+        with mock.patch.object(paper_live, "generate_expected_filings", return_value=self.new_manifest):
+            with self.assertRaisesRegex(ValidationError, "signal_snapshots"):
+                paper_live.correct_expected_periods(
+                    self.store, self.config, "2026Q3", "2026-09-30", apply=True
+                )
+        self.assertEqual(
+            self.store.query("SELECT filing_key FROM expected_filings WHERE cycle_id = ?", (self.cycle_id,))[0]["filing_key"],
+            "1-2026-10-31-10-Q",
+        )
+
     def test_period_correction_preserves_unrelated_model_block(self) -> None:
         self.store.set_cycle_model_status(self.cycle_id, "BLOCKED", reason="manual review")
         with mock.patch.object(paper_live, "generate_expected_filings", return_value=self.new_manifest):
@@ -530,14 +668,17 @@ class PointInTimeTests(unittest.TestCase):
         names = ["Revenue", "NetIncome", "Assets", "StockholdersEquity"]
         accession, period = "acc-current", "2026-09-30"
 
-        def make_facts(revenue_value: float | None, revenue_period: str = period) -> dict:
+        def make_facts(
+            revenue_value: float | None, revenue_period: str = period, revenue_unit: str = "USD",
+        ) -> dict:
             gaap = {}
             for name in names:
                 tag = (sec_edgar.DURATION_TAGS if name in sec_edgar.DURATION_TAGS
                        else sec_edgar.INSTANT_TAGS)[name][0]
                 end = revenue_period if name == "Revenue" else period
                 value = revenue_value if name == "Revenue" else 100.0
-                gaap[tag] = {"units": {"USD": [{"accn": accession, "end": end, "val": value}]}}
+                unit = revenue_unit if name == "Revenue" else "USD"
+                gaap[tag] = {"units": {unit: [{"accn": accession, "end": end, "val": value}]}}
             return {"facts": {"us-gaap": gaap}}
 
         source = paper_live.SecFilingSource({"required_facts": names})
@@ -548,6 +689,17 @@ class PointInTimeTests(unittest.TestCase):
         with mock.patch.object(sec_edgar, "get_company_facts", return_value=make_facts(10.0, "2026-06-30")), \
                 mock.patch.object(paper_live.ixf, "enabled_for", return_value=False):
             self.assertFalse(source._facts_ready(123, accession, names, period))
+
+        for unit in ("EUR", "XYZ"):
+            with mock.patch.object(
+                sec_edgar, "get_company_facts", return_value=make_facts(10.0, revenue_unit=unit)
+            ), mock.patch.object(paper_live.ixf, "enabled_for", return_value=False):
+                self.assertFalse(source._facts_ready(123, accession, names, period), unit)
+
+        with mock.patch.object(
+            sec_edgar, "get_company_facts", return_value=make_facts(10.0)
+        ), mock.patch.object(paper_live.ixf, "enabled_for", return_value=False):
+            self.assertTrue(source._facts_ready(123, accession, names, period))
 
         with mock.patch.object(sec_edgar, "get_company_facts", return_value=make_facts(None)), \
                 mock.patch.object(paper_live.ixf, "enabled_for", return_value=True), \

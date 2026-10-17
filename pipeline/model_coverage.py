@@ -24,9 +24,17 @@ import numpy as np
 import pandas as pd
 
 try:
-    from . import freeze as fz, paper_live as pl, prices as pr, ratios as ra, sec_edgar as se, universe_asof as ua
+    from . import freeze as fz, paper_live as pl, prices as pr, ratios as ra, sec_edgar as se
+    from . import universe_asof as ua
+    from .paper_timeline import cycle_timeline
 except ImportError:  # pragma: no cover - script execution
-    import freeze as fz, paper_live as pl, prices as pr, ratios as ra, sec_edgar as se, universe_asof as ua  # type: ignore
+    import freeze as fz  # type: ignore
+    import paper_live as pl  # type: ignore
+    import prices as pr  # type: ignore
+    import ratios as ra  # type: ignore
+    import sec_edgar as se  # type: ignore
+    import universe_asof as ua  # type: ignore
+    from paper_timeline import cycle_timeline  # type: ignore
 
 # Feature -> raw inputs. A feature is NOT_APPLICABLE only if the company never filed the concept.
 FEATURE_INPUTS = {
@@ -385,6 +393,39 @@ def _sqlite_content_hash(path: Path) -> str:
         connection.close()
 
 
+def _cycle_timeline_rows(connection: sqlite3.Connection, cycle_key: str) -> list[Mapping[str, object]]:
+    connection.row_factory = sqlite3.Row
+    columns = {
+        row["name"] for row in connection.execute("PRAGMA table_info(expected_filings)")
+    }
+    if "facts_ready_at" not in columns:
+        version = connection.execute("PRAGMA user_version").fetchone()[0]
+        raise ValueError(
+            f"cycle {cycle_key} database schema {version} lacks expected_filings.facts_ready_at; "
+            "migrate a secured database copy and recheck existing READY filings to record a verified "
+            "availability time. Do not infer it from filed_at, first_seen_at, or updated_at."
+        )
+    rows = connection.execute(
+        "SELECT e.filing_key,e.filed_at,e.first_seen_at,e.facts_ready_at,r.recorded_at "
+        "FROM expected_filings e JOIN reporting_cycles c ON c.cycle_id=e.cycle_id "
+        "LEFT JOIN filing_resolutions r ON r.cycle_id=e.cycle_id AND r.filing_key=e.filing_key "
+        "WHERE c.cycle_key=? AND c.strategy!='spy_buy_hold_v1'",
+        (cycle_key,),
+    ).fetchall()
+    missing = [
+        row["filing_key"] for row in rows
+        if not row["recorded_at"] and not all(
+            row[field] for field in ("filed_at", "first_seen_at", "facts_ready_at")
+        )
+    ]
+    if missing:
+        raise ValueError(
+            f"cycle {cycle_key} has {len(missing)} ordinary filing rows without complete persisted "
+            "publication/observation/facts-readiness timestamps; recheck them before a point-in-time run"
+        )
+    return [dict(row) for row in rows]
+
+
 def _data_fingerprint(config: Mapping) -> dict:
     import hashlib
     manifest = fz.build_file_manifest(config)
@@ -418,8 +459,9 @@ def suite(
     cycle_key: str,
     config_path: str | None,
     compare_run_id: str | None = None,
+    snapshot_from: str | Path | None = None,
 ) -> Path:
-    """Build one complete immutable input snapshot, then run all thresholds offline against it."""
+    """Build or reuse one immutable input snapshot, then run all thresholds offline against it."""
     import copy
     import uuid
 
@@ -432,7 +474,19 @@ def suite(
     (out / "source_manifest_before.json").write_text(
         json.dumps(source_manifest_before, indent=1, sort_keys=True)
     )
-    snapshot_db = fz.create_input_snapshot(config, snapshot_root)
+    if snapshot_from is None:
+        snapshot_db = fz.create_input_snapshot(config, snapshot_root)
+    else:
+        snapshot_root = Path(snapshot_from).expanduser().resolve()
+        if not snapshot_root.is_dir():
+            raise FileNotFoundError(f"shared input snapshot not found: {snapshot_root}")
+        snapshot_db = snapshot_root / pl.resolve_path(config, "database").relative_to(source_root)
+        if not snapshot_db.is_file():
+            raise FileNotFoundError(f"shared snapshot database not found: {snapshot_db}")
+        (out / "shared_snapshot.json").write_text(json.dumps({
+            "snapshot_root": str(snapshot_root),
+            "snapshot_database": str(snapshot_db),
+        }, indent=2, sort_keys=True))
     snapshot_config = fz.config_for_snapshot(config, snapshot_root)
     source_db = pl.resolve_path(config, "database")
     source_db_relative = source_db.relative_to(source_root).as_posix()
@@ -460,20 +514,12 @@ def suite(
 
     db = pl.resolve_path(snapshot_config, "database")
     connection = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
-    row = connection.execute(
-        "SELECT MAX(event_at) FROM ("
-        "SELECT e.updated_at AS event_at FROM expected_filings e JOIN reporting_cycles c "
-        "ON c.cycle_id=e.cycle_id WHERE c.cycle_key=? AND c.strategy!='spy_buy_hold_v1' "
-        "UNION ALL SELECT r.recorded_at AS event_at FROM filing_resolutions r JOIN reporting_cycles c "
-        "ON c.cycle_id=r.cycle_id WHERE c.cycle_key=? AND c.strategy!='spy_buy_hold_v1')",
-        (cycle_key, cycle_key),
-    ).fetchone()
-    connection.close()
-    if not row or not row[0]:
-        raise ValueError(f"no persistent ML-cycle filing events found for {cycle_key}")
-    snapshot = pd.Timestamp(row[0])
-    if snapshot.tzinfo is None:
-        snapshot = snapshot.tz_localize("UTC")
+    try:
+        timeline_rows = _cycle_timeline_rows(connection, cycle_key)
+    finally:
+        connection.close()
+    timeline = cycle_timeline(timeline_rows)
+    snapshot = pd.Timestamp(timeline["snapshot_as_of"])
     evaluation_time = pd.Timestamp.now(tz="UTC")
     header = {
         "run_id": run_id,
@@ -769,6 +815,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--model-run", help="JSON written by `model-run` to include forecast/optimisation stages")
     parser.add_argument("--out", help="output file (default under state/diagnostics/)")
     parser.add_argument("--compare-run-id", help="explicit prior run directory for record-level forecast comparison")
+    parser.add_argument("--snapshot-from", help="reuse an exact prior run snapshot for independent offline replay")
     args = parser.parse_args(argv)
     se.require_user_agent()
     config = pl.load_config(args.config)
@@ -794,7 +841,9 @@ def main(argv: list[str] | None = None) -> int:
         print(path, "failed:", log["missing_or_failed"])
         return 0
     if args.command == "suite":
-        print("suite written to", suite(config, args.cycle_key, args.config, args.compare_run_id))
+        print("suite written to", suite(
+            config, args.cycle_key, args.config, args.compare_run_id, args.snapshot_from
+        ))
         return 0
     if args.command == "readiness":
         manifest = json.loads((pl.resolve_path(config, "manifest_dir") / f"{args.cycle_key}.json").read_text())
@@ -817,9 +866,11 @@ def main(argv: list[str] | None = None) -> int:
         provider.enforce_eligibility = False  # diagnostic ranking; eligibility is recorded per forecast
         db = pl.resolve_path(config, "database")
         connection = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
-        snapshot = connection.execute("SELECT MAX(first_seen_at) FROM expected_filings WHERE first_seen_at IS NOT NULL"
-                                      ).fetchone()[0]
-        connection.close()
+        try:
+            timeline_rows = _cycle_timeline_rows(connection, args.cycle_key)
+        finally:
+            connection.close()
+        snapshot = cycle_timeline(timeline_rows)["snapshot_as_of"]
         result = provider.predict_as_of(snapshot)
         path = Path(args.out or out_dir / f"model_run_{args.cycle_key}.json")
         path.write_text(json.dumps({"signal_as_of": result.signal_as_of, "data_snapshot": result.data_snapshot,

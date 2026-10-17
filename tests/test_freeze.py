@@ -1,5 +1,6 @@
 """Offline guard, manifest comparison and status-group arithmetic (synthetic, no network)."""
 import sys
+import hashlib
 import json
 import os
 import sqlite3
@@ -48,6 +49,10 @@ class Guard(unittest.TestCase):
             config_dir.mkdir()
             config_path = config_dir / "real_paper.json"
             config_path.write_text(json.dumps({"database": str(database)}))
+            bytecode_dir = root / "pipeline" / "__pycache__"
+            bytecode_dir.mkdir(parents=True)
+            (bytecode_dir / "ignored.cpython-312.pyc").write_bytes(b"not an input")
+            (root / "pipeline" / "source.py").write_text("value = 1\n")
             training_dir = root / "Data" / "1-focasting_data"
             training_dir.mkdir(parents=True)
             (training_dir / "sector10.csv").write_text("date,value\n2026-01-01,1\n")
@@ -58,6 +63,8 @@ class Guard(unittest.TestCase):
                 "_path": str(config_path),
             }
             source_manifest = fz.build_file_manifest(config)
+            self.assertNotIn("pipeline/__pycache__/ignored.cpython-312.pyc", source_manifest["files"])
+            self.assertIn("pipeline/source.py", source_manifest["files"])
             snapshot_root = root / "snapshot"
             snapshot_db = fz.create_input_snapshot(config, snapshot_root)
             snapshot_config = fz.config_for_snapshot(config, snapshot_root)
@@ -112,6 +119,61 @@ class Guard(unittest.TestCase):
                 self.assertEqual(__import__("paper_live").REPO_ROOT, root.resolve())
                 self.assertEqual(__import__("prices").CACHE_DIR, root.resolve() / "cache" / "prices")
         self.assertEqual(__import__("paper_live").REPO_ROOT, previous_root)
+
+    def test_ixbrl_reads_snapshot_and_clears_loaded_filing_cache(self):
+        import ixbrl
+        import ixbrl_fallback
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source_cache = root / "source" / "cache" / "filings"
+            snapshot_cache = root / "snapshot" / "cache" / "filings"
+            relative = Path("123") / "0000000123-26-000001" / "report.htm"
+            source_path, snapshot_path = source_cache / relative, snapshot_cache / relative
+            source_path.parent.mkdir(parents=True)
+            snapshot_path.parent.mkdir(parents=True)
+
+            def write_cached(path: Path, content: bytes) -> None:
+                path.write_bytes(content)
+                path.with_name(path.name + ".meta.json").write_text(json.dumps({
+                    "sha256": hashlib.sha256(content).hexdigest(),
+                    "accession": "0000000123-26-000001",
+                    "cik": 123,
+                }))
+
+            write_cached(source_path, b"SOURCE")
+            write_cached(snapshot_path, b"SNAPSHOT")
+            original_cache = ixbrl.FILING_CACHE
+            ixbrl_fallback._facts.cache_clear()
+            try:
+                ixbrl.FILING_CACHE = source_cache
+                with mock.patch.object(
+                    ixbrl, "filing_facts",
+                    side_effect=lambda cik, accession, document:
+                    [ixbrl.fetch_document(cik, accession, document)[0].decode()],
+                ):
+                    self.assertEqual(
+                        ixbrl_fallback._facts(123, "0000000123-26-000001", "report.htm"),
+                        ("SOURCE",),
+                    )
+                    disabled_source = source_cache.with_name("filings-disabled")
+                    source_cache.rename(disabled_source)
+                    try:
+                        with fz.snapshot_context(root / "snapshot"):
+                            self.assertEqual(
+                                ixbrl.FILING_CACHE, snapshot_cache.resolve(),
+                            )
+                            self.assertEqual(
+                                ixbrl_fallback._facts(
+                                    123, "0000000123-26-000001", "report.htm"
+                                ),
+                                ("SNAPSHOT",),
+                            )
+                    finally:
+                        disabled_source.rename(source_cache)
+            finally:
+                ixbrl.FILING_CACHE = original_cache
+                ixbrl_fallback._facts.cache_clear()
 
 
 class DatabaseFilings(unittest.TestCase):

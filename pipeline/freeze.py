@@ -15,9 +15,16 @@ from pathlib import Path
 from typing import Mapping
 
 try:
-    from . import paper_live as pl, prices as pr, sec_edgar as se, universe as uv, universe_asof as ua
+    from . import ixbrl as ix, ixbrl_fallback as ixf, paper_live as pl, prices as pr
+    from . import sec_edgar as se, universe as uv, universe_asof as ua
 except ImportError:  # pragma: no cover
-    import paper_live as pl, prices as pr, sec_edgar as se, universe as uv, universe_asof as ua  # type: ignore
+    import ixbrl as ix  # type: ignore
+    import ixbrl_fallback as ixf  # type: ignore
+    import paper_live as pl  # type: ignore
+    import prices as pr  # type: ignore
+    import sec_edgar as se  # type: ignore
+    import universe as uv  # type: ignore
+    import universe_asof as ua  # type: ignore
 
 import pandas as pd
 import requests
@@ -38,27 +45,36 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _is_snapshot_file(path: Path) -> bool:
+    return (
+        path.is_file()
+        and path.name != ".DS_Store"
+        and "__pycache__" not in path.parts
+        and path.suffix != ".pyc"
+    )
+
+
 def input_files(config: Mapping) -> list[Path]:
     root = pl.resolve_path(config, "database").parent.parent
     cache = root / "cache"
     files: list[Path] = []
     for sub in INPUT_DIRS:
         if (cache / sub).exists():
-            files += [f for f in (cache / sub).rglob("*") if f.is_file() and f.name != ".DS_Store"]
+            files += [f for f in (cache / sub).rglob("*") if _is_snapshot_file(f)]
     for pattern in INPUT_FILES_GLOB:
-        files += [f for f in cache.glob(pattern) if f.is_file()]
+        files += [f for f in cache.glob(pattern) if _is_snapshot_file(f)]
     for sub in ("Data", "code", "pipeline", "tests"):
         directory = root / sub
         if directory.exists():
             files += [f for f in directory.rglob("*")
-                      if f.is_file() and f.name != ".DS_Store"
+                      if _is_snapshot_file(f)
                       and (sub not in ("code", "pipeline") or f.suffix == ".py"
                            or f.name == "requirements.txt")]
     manifest_dir = pl.resolve_path(config, "manifest_dir")
-    files += [f for f in manifest_dir.glob("*.json") if f.is_file()]
+    files += [f for f in manifest_dir.glob("*.json") if _is_snapshot_file(f)]
     source_dir = root / "state" / "sources"
     if source_dir.exists():
-        files += [f for f in source_dir.rglob("*") if f.is_file() and f.name != ".DS_Store"]
+        files += [f for f in source_dir.rglob("*") if _is_snapshot_file(f)]
     database = pl.resolve_path(config, "database")
     if database.is_file():
         files.append(database)
@@ -141,9 +157,10 @@ def snapshot_context(root: str | Path):
     previous = (
         pl.REPO_ROOT, pr.CACHE_DIR, se.CACHE_DIR, se.SUBMISSIONS_DIR,
         uv.CACHE_FILE, uv.HISTORICAL_MEMBERSHIP_CACHE, uv.SEC_TICKERS_CACHE,
-        ua.CACHE, ua.SECTOR_LOOKUP_CACHE, list(sys.path),
+        ua.CACHE, ua.SECTOR_LOOKUP_CACHE, ix.FILING_CACHE, list(sys.path),
     )
     prior_ml_model = sys.modules.pop("ml_model", None)
+    ixf._facts.cache_clear()
     pl.REPO_ROOT = root
     pr.CACHE_DIR = root / "cache" / "prices"
     se.CACHE_DIR = root / "cache" / "secfacts"
@@ -153,13 +170,15 @@ def snapshot_context(root: str | Path):
     uv.SEC_TICKERS_CACHE = root / "cache" / "sec_company_tickers.json"
     ua.CACHE = root / "cache" / "sp500_changes.json"
     ua.SECTOR_LOOKUP_CACHE = root / "cache" / "universe_sector_lookup.json"
+    ix.FILING_CACHE = root / "cache" / "filings"
     sys.path.insert(0, str(root / "code"))
     try:
         yield
     finally:
         (pl.REPO_ROOT, pr.CACHE_DIR, se.CACHE_DIR, se.SUBMISSIONS_DIR,
          uv.CACHE_FILE, uv.HISTORICAL_MEMBERSHIP_CACHE, uv.SEC_TICKERS_CACHE,
-         ua.CACHE, ua.SECTOR_LOOKUP_CACHE, original_path) = previous
+         ua.CACHE, ua.SECTOR_LOOKUP_CACHE, ix.FILING_CACHE, original_path) = previous
+        ixf._facts.cache_clear()
         sys.path[:] = original_path
         sys.modules.pop("ml_model", None)
         if prior_ml_model is not None:

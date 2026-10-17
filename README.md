@@ -10,6 +10,198 @@ When referring to the upstream implementation, also cite and link to the [origin
 
 ## Purpose and status
 
+### Validation performance without model changes
+
+Historical and signal-panel validation indexes membership once per call instead of scanning
+the entire membership table for every row. Period windows and label-end times are reused only
+within that validation call; no persistent cache can conceal changed inputs. Every nonmissing
+feature component still receives its source, publication and cutoff checks. Estimators,
+features, thresholds, forecasts and optimizer arithmetic are unchanged.
+
+A local five-repeat comparison on the same synthetic 2,100-row / 42,000-component panel
+measured median validation time of 0.793 s before versus 0.136 s after (about 5.8x).
+This measures this validation stage, not the full model runtime or predictive accuracy.
+Valid inputs and ten intentionally invalid variants produced identical accept/reject results
+and error messages. Hardware and input sizes affect timing.
+
+### Portable quick start (no private cache required)
+
+From the cloned checkout on macOS or Linux, using Python 3.12 (reference: 3.12.2).
+On Windows, use WSL2/Linux: the durable process locks use POSIX `fcntl`, so native
+Windows execution is not currently supported.
+
+```bash
+python3 -m venv .venv
+# macOS / Linux:
+source .venv/bin/activate
+python -m pip install -r pipeline/requirements.txt
+python reproduce.py check
+python reproduce.py test
+python reproduce.py demo
+python reproduce.py dashboard
+```
+
+Open `http://127.0.0.1:8765`. The demo is explicitly synthetic, works offline, creates
+`state/reproduction/synthetic.sqlite3` and never starts a scheduler or broker orders.
+It refuses to overwrite an existing demo database. Preserve that database for viewing;
+to repeat from scratch, use the existing CLI with a new relative database filename:
+
+```bash
+python -m pipeline.paper_portfolio --env synthetic --db state/reproduction/second.sqlite3 demo
+```
+
+The portable launcher anchors execution to its own checkout, not the caller's working
+directory. It can also be called from elsewhere with a relative path to `reproduce.py`.
+There are no user-specific home-directory paths in its commands. Runtime code necessarily
+resolves local filesystem locations internally; relative configuration paths are not
+replaced with another user's machine paths.
+
+This reproduces the software tests and synthetic depot flow, **not the private Q2 research
+snapshot**. Real runs additionally require SEC identification, acquired source data and
+reviewed manifests. Local `state/`, caches, databases and backups are intentionally not
+distributed. Set `DYNAMIC_STOCK_USER_AGENT` in your own environment before SEC acquisition;
+the placeholder in `.env.example` is not a real contact and that file is not auto-loaded.
+Never commit the actual contact or credentials. Original dataset redistribution rights
+must be checked independently. Research commands naming dated local snapshots are audit
+records, not fresh-clone quick-start commands.
+
+Direct dependencies are pinned and checked. This is not yet a cross-platform lock of
+all transitive dependencies or a guarantee of bit-identical scientific results across
+Python, BLAS and OS versions. Missing local real-source fixtures are explicitly skipped
+in offline tests rather than represented as historical evidence.
+GitHub Actions runs the dependency check, offline tests and demo on Linux and macOS;
+these remote checks only execute once the workflow is published.
+
+### Manual paper workflow: current result, 2026-10-16
+
+**Update after PSKY recovery:** the same-class history is now recovered via the source's current
+SKYD alias, with original company/exchange continuity evidence, not predecessor concatenation.
+The exact 253-session interval is 2025-08-28–2026-08-31. A new fully copied input/code snapshot
+`state/research/diagnostics/20261016-q2-psky-full-snapshot/` completed both offline passes.
+**All three numerical optimizations now succeed**: 76 positive equal weights, 39 minimum-variance
+and 37 Max-Sharpe positions above `1e-9`. Each result is fully invested, long-only and capped at 5%.
+All 362 forecasts, the 76-stock selection and retained features match the previous diagnostic exactly;
+only PSKY's missing covariance input was intentionally repaired. Independent exhaustive split-basis
+verification, causal feature/label qualification and the real ISIN map are still open.
+The three downloadable `*_DIAGNOSTIC_UNVERIFIED.csv` files are **not handoff portfolios**.
+The covariance errors described in the earlier bullets below are the preserved earlier run, not
+the current numerical result.
+
+**Original-reference policy:** all eleven local original sector workbooks are byte-identical to
+upstream commit `0f29f6027fe4061a1484fb7529402706b3903aca` (commit timestamp 2018-06-06).
+That timestamp alone does not independently prove when the bytes became public.
+The user's explicit `original-repository-reference-assumption-v1` accepts these identified
+files as reference inputs, **not as PIT-certified historical observations**. The diagnostic's
+`--original-reference-assumption` option freezes all eleven files and compares every retained
+original training row, all 20 features and its target to the original workbook. Only numerical
+CSV round-trip noise is tolerated. Missing, ambiguous or changed source rows fail explicitly.
+The option never applies to SEC rows, identity, membership or unknown target/action definitions.
+The dashboard exposes the assumption and the row-level source comparison separately.
+
+The signal-only executor also supports the explicit definition
+`training_vintage_policy=published-version-at-training-v1`: verified training versions must
+exist by the target model's training cutoff, not necessarily by their original feature quarter.
+The four validation decisions and current prediction retain their own cutoffs. Labels still
+need to be completed by training. Omission preserves `own-decision-vintage-v1`, including the
+37-quarter executor's strict historical default. Neither policy certifies source versions or
+promotes the original-reference assumption into `VERIFIED`. In particular, 2026 reference
+eligibility is not evidence that the same bytes were available for a 2017 decision.
+
+```bash
+.venv/bin/python -m pipeline.q2_numeric_diagnostic \
+  --identities state/research/acquisition/20261016-q2-primary-cases-final-c/security_identities.json \
+  --psky-covariance state/research/acquisition/20261016-psky-253-recovered/PSKY_253_covariance_levels.csv \
+  --original-reference-assumption --output state/research/diagnostics/NEW_UNUSED_RUN
+```
+
+The current process now captures calculation times; provenance status strings or a nonempty evidence
+list no longer qualify a current handoff. Late-downloaded, exact original SEC releases can be checked
+against actual source bytes, original acceptance, context/entity, value and retrieval receipt.
+The checker was executed on the real MMM original, not just synthetic fixtures. Its result is still
+not a certificate for the entire feature dataset.
+
+`pipeline/paper_manual_run.py` wires reviewed source acquisition, checks, snapshot, signal/replay,
+export and independent import without a manually authored signal JSON. **It is not yet a complete
+raw SEC-to-qualified-training-panel builder** and no real fully qualified source plan exists.
+The exact outstanding row inventory is:
+16,892 training rows (5,769 original historical / 11,123 SEC), 1,701 SEC validation rows and
+362 SEC prediction rows, requiring 202,822 retained feature cells. 4,863 cached nominal trade dates
+do not match the required actual execution session; labels need source-based recalculation/proof.
+These rows are enumerated in `state/research/acquisition/20261016-q2-required-inputs-exact/`.
+Training labels are checked at model-training cutoff, not incorrectly at their earlier feature cutoff.
+
+The new `portfolio_consumer.ConsumerLedger` adds account/strategy-bound durable progress, reconciliation,
+partial execution, crash recovery and explicit replacement semantics. Its 19 simulated-consumer tests
+are technical evidence only; no broker adapter or external exactly-once guarantee is claimed.
+
+The earlier dated live-readiness descriptions below are not the manual historical paper rule.
+The manual path never requires all 500 issuers to be READY: evidenced nonpublication may exclude
+an issuer; a missing cached published report or unresolved identity requires acquisition/review,
+not an invented exclusion. No scheduler, broker connection, production order or automatic rebalance
+has been enabled.
+
+* A **real-data numerical Q2 diagnostic completed twice offline**: 362 forecasts, 76 selected
+  securities, 11 sectors. Every sector actually used 40 training quarters (2015Q1–2024Q4) and four
+  validation quarters (2025Q1–2025Q4). Inputs include original historical **and newer SEC hybrid
+  rows**, not only the original files ending in 2017. The frozen run exports the exact rows/features.
+  Both numerical passes match. This is today's cached Q2-period analysis, **not a historically
+  admissible August-31 signal** and not historical return validation.
+* Equal weighting completed numerically. Both covariance-dependent strategies explicitly failed:
+  selected PSKY lacks 253 complete pre-cutoff daily levels. No substituted weights or forced
+  removal of PSKY. Diagnostic: `state/research/diagnostics/20261016-q2-numeric-final-identities/`.
+* Original cover/class matches increased to **502 securities / 499 issuers** within 503/500.
+  C, MMM, NDAQ and RVTY are resolved. SMCI has an original August-11 release with 44 exact
+  observations; it is **not** automatically excluded as unpublished. The release does not disclose
+  period-end shares outstanding; weighted-average shares are not a replacement.
+* Genuine primary SPY NAV/distribution TR now contains **5,755 NYSE observations and 93
+  distributions, 2003-12-01–2026-10-15**, as a separate complete series without splicing.
+  The acquired 1993-onward provider market history is not yet a certified 1995-onward TR comparison.
+* **The genuine historical Q2 signal has not started**, and the 37-quarter continuation and
+  certified continuous 1995-onward strategy valuation are not complete. Historical validation
+  stays `NOT_VALIDATED`. Additional HTML comparison alone is not a blanket signal blocker;
+  exact required feature/label versions and causal training inputs are.
+
+Signal calculation now runs independently of the valuation cash ledger. Missing dividend pay
+dates or a full 37-quarter valuation do not themselves prevent a source-qualified Q2 signal.
+The reviewed SIGNAL bundle still needs causal training/validation, definitions, identities and
+covariance evidence; it is not created by relabelling the diagnostic caches.
+
+Manual commands, from this repository directory:
+
+```bash
+# Show the real future paper window; does not acquire data or start a scheduler.
+.venv/bin/python -m pipeline.paper_quarter schedule --cycle 2026Q3
+
+# Run an isolated, source-reviewed SIGNAL bundle twice offline (no portfolio DB).
+.venv/bin/python -m pipeline.paper_signal_execution \
+  --bundle REVIEWED_SIGNAL_BUNDLE --output NEW_SIGNAL_RUN --cycle 2026Q2
+.venv/bin/python -m pipeline.paper_quarter from-signal \
+  --execution-dir NEW_SIGNAL_RUN --output NEW_SIGNAL_RESULT.json
+.venv/bin/python -m pipeline.paper_quarter research \
+  --signal-result NEW_SIGNAL_RESULT.json --instrument-map VERIFIED_INSTRUMENT_MAP.json \
+  --output state/research/target_portfolios
+.venv/bin/python -m pipeline.paper_quarter validate --package EXPORTED_PACKAGE
+.venv/bin/python -m pipeline.paper_quarter list
+
+# Run the existing test suite, including synthetic end-to-end signal/package/import tests.
+.venv/bin/python -m unittest discover -s tests -v
+```
+
+Uppercase paths denote required reviewed inputs, **not files already supplied**. No verified real
+ISIN map or historically qualified SIGNAL bundle currently exists. The `regular` CLI accepts an
+already computed, qualified signal and enforces its actual window; it does **not yet implement an
+automatic acquire-all-data-to-qualified-signal command**. A historical or stale result cannot become
+a current handoff by changing its filename. Full contract: [EXECUTION_INTERFACE.md](EXECUTION_INTERFACE.md).
+Atomic packages include three CSVs only when all three strategies and identities succeed;
+otherwise a failed strategy has an explicit `.FAILED.json`, not an empty or fabricated CSV.
+Dashboard downloads verify integrity and never claim/process a portfolio.
+
+The optimizer is explicitly versioned `annual-log-max-sharpe-v1`, labelled
+**Rendite/Risiko – Max-Sharpe**, with an explicit 1.5% annual risk-free assumption. Forecast means,
+covariance and risk-free rate share annual log units; the weighted-log objective is an approximation,
+not an exact MATLAB reproduction or a conventional simple-return Sharpe claim. A zero-risk
+denominator is an error, never a manufactured successful result.
+
 The project selects S&P 500 stocks each quarter using fundamental indicators. It uses sector-specific models, rolling training windows, and five regression methods:
 
 - Linear regression
@@ -203,6 +395,20 @@ database.
 The runner refuses real adapters on a non-real database and vice versa; the CLI refuses an
 `--env` that differs from the database marker.
 
+The dashboard's live target-weight comparison is sourced only from a persisted depot signal.
+Separately, it displays the hash-verified archived result from run
+`20261014T195516Z-071b27` (50% feature-coverage threshold, eligibility gate enabled) as historical
+model output. Those archived weights are not imported into the depot ledger, are not an active
+signal, and did not create orders; historical validation remains `NOT_VALIDATED`.
+
+The dashboard also offers a read-only research view for complete, hash-verified archived runs,
+including their available feature-coverage thresholds, diagnostic/enforced modes, forecasts, and
+portfolio weights. It keeps missing or infeasible optimizer weights empty and labels the latest
+attempt separately from the latest complete run. Search, sector filtering, paginated stock rows,
+and CSV export affect only the browser presentation; they do not write to the depot. A live
+depot panel continues to show only persisted target weights and actual valuations. The research
+view never promotes an archive to a live signal or historical validation result.
+
 ### Flow per cycle
 1. `generate-cycle` derives the expected reports: universe members at `universe_as_of` (default: the
    quarter end, frozen in `state/expected_filings/<cycle>.json`; a different date is refused),
@@ -371,23 +577,71 @@ Status: **real-data diagnosis and integration verified up to the readiness gate;
   no rebalancing fills). SPY `adj_close` is an additionally labelled total-return approximation.
 * **Dashboard**: disjoint report groups (`READY`, `WAITING_FACTS`, `CORPORATE_ACTION_RESOLVED`,
   `WAITING_FILING`, `INVALID_DATA`); stock weight comparison (benchmark / ML target / actual, benchmark weight descending)
-  and sector comparison (full GICS names), data states, sources, cash, and a diagnostic-only banner with no targets shown.
+  and sector bar comparison (full GICS names), data states, sources, cash, and a diagnostic-only banner with no targets shown.
   Actual stock weights use per-symbol quantity, raw close and market value persisted at exactly the same timestamp as NAV;
   legacy marks without that valuation evidence remain blank rather than being reconstructed from stale fill prices.
+  In the all-stocks table, company names and tickers are green when their weight exceeds `1e-9` in the selected archived
+  ML run, analysis variant, and strategy. This highlight also appears in the live view, but does not indicate a held position
+  or an executable signal; zero-weight and forecast-only stocks are not highlighted.
+  The **Veröffentlichungen** tab adds weekly publication-delay bars relative to official calendar quarter-end.
+  It separates SEC 10-Q/10-K acceptance from verified first earnings releases, with company counts and sourced
+  quarter-end issuer market-cap totals. The quarter selector also lists locally analysed historical quarters.
+  The historical view pools up to twelve preceding quarters with their own membership and counts issuer-quarter
+  observations, not distinct companies. Negative delays and delays of 91+ days are retained.
+  Unknown dates/capitalizations are shown as missing, never as zero; recent quarters remain right-censored.
+  Historical membership comes from cached snapshots; historical CIK mappings are not fully time-versioned.
+  Neither 8-K event dates nor SPY holdings weights substitute for first release dates or market capitalization.
+  Generate/update the read-only chart dataset explicitly after updating source caches:
+
+  ```bash
+  .venv/bin/python -m pipeline.publication_timing --history-quarters 12
+  ```
+
+  This command uses local inputs only, writes `state/diagnostics/publication_timing.json` with source hashes,
+  and never changes portfolio databases, model archives or scheduler state. Opening the dashboard does not fetch
+  data or regenerate this report. The generation timestamp and missing coverage remain visible.
+  Optional independently verified sources can be supplied in `state/sources/publication_timing_evidence.json`:
+
+  ```json
+  {
+    "schema_version": 1,
+    "earnings": [{
+      "cycle_key": "2026Q2", "company_id": "123", "period_end": "2026-06-30",
+      "published_on": "2026-07-30", "first_publication_verified": true,
+      "source_url": "https://issuer.example/verified-release",
+      "observed_at": "2026-10-16T00:00:00Z"
+    }],
+    "market_caps": [{
+      "cycle_key": "2026Q2", "company_id": "123", "as_of": "2026-06-30",
+      "scope": "issuer_all_share_classes", "value_usd": 1000000000,
+      "source_url": "https://provider.example/verified-quarter-end-cap",
+      "observed_at": "2026-10-16T00:00:00Z"
+    }]
+  }
+  ```
+
+  This is a schema example, not real data. Earnings dates must be actual first releases, not estimates, and refer
+  to the matched fiscal report period. Publication dates use the US Eastern calendar. Market caps must cover all
+  issuer share classes, in USD at official quarter-end; current cap, public float and adjusted-close/share products
+  do not satisfy this requirement. Invalid or duplicate evidence fails explicitly.
   `BRK.B`/`BF.B` provider symbols map explicitly to `BRK-B`/`BF-B` model symbols. Benchmark weights: official SPY holdings file
   (State Street, 2026-10-13, 506 positions, SHA-256
   `aa260f9d…741d7c`, archived in `state/sources/`) – an ETF holding on that date, not the index, not necessarily the portfolio start.
+  Cash and non-equity SPY instruments are shown separately from equity weights; raw holdings totals are not normalized.
   The read-only page now also shows company name, benchmark-relative actual deviation, top-stock bars, portfolio NAV/cash/receivables,
   a NAV comparison on timestamps shared by ML and SPY portfolios from their common first daily mark, the additional explicitly
-  labelled SPY `adj_close` proxy, and a 60-second display refresh. It does not refresh or mutate benchmark holdings automatically.
+  labelled SPY `adj_close` proxy, and a 60-second display refresh. Explicit real `tick`/`scheduler` runs refresh archived SPY
+  holdings at most daily, with persistent retry status; merely opening the dashboard does not make a network request. The
+  scheduler remains off unless its command is explicitly started.
 * **HONA**: 8-K 0002089271-26-000020 (filed 2026-08-05, SHA-256 `04635e01…4b85f6d`, archived in `cache/filings/`) proves the quarter end
   2026-09-26, not that the Q3 10-Q exists.
 * **Validation manifest** (`python pipeline/validation_manifest.py build` → `state/validation/validation_manifest.json`): records code
   hash, configuration, input hashes, periods and limitations; all five evidence categories are `verified: false` (raw price basis,
   corporate actions, historical membership, point-in-time labels, benchmark provenance) and no walk-forward result exists. Result:
   `NOT_VALIDATED`. Configure it via `validation_manifest` in the config to show it in the dashboard.
-* **Schema v5 migration**: daily marks now retain immutable per-symbol quantity, raw-close price and market value for
-  same-time dashboard weights. Upgrade an existing v1–v4 store explicitly with
+* **Schema v6 migration**: daily marks retain immutable per-symbol quantity, raw-close price and market value for
+  same-time dashboard weights; `facts_ready_at` records the first time required facts became usable, independently of
+  filing publication and first observation. Upgrade an existing v1–v5 store explicitly with
   `python pipeline/paper_portfolio.py --env real --db state/real_paper.sqlite3 migrate --backup-dir state/backups`.
   The migration verifies a SQLite backup before the additive schema change; prior depot ledgers and marks are retained.
 
@@ -397,7 +651,7 @@ validation, and an explicit decision on enabling the scheduler. Readiness counts
 static list as a current report count.
 
 ### Consistency correction and reproducible run (2026-10-14)
-* **Cycle period rule correction**: the old expectation rule (`window-pm45d-v1`, ±45 days) could assign period ends after the cycle date (e.g. 2026-10-31 for cycle key 2026Q3). The implemented rule is now **`calendar-quarter-v2`**: period end in `(previous quarter end + 7 days, quarter end + 7 days]`.
+* **Cycle period rule correction**: a `2026Q3` cycle denotes the calendar quarter July–September, not a fiscal year-end quarter. The old expectation rule (`window-pm45d-v1`, ±45 days) could assign period ends after the cycle date (e.g. 2026-10-31 for cycle key 2026Q3). The implemented rule is now **`calendar-quarter-v2`**: actual period end in `(previous calendar-quarter end + 7 days, current quarter end + 7 days]`; the seven-day tolerance is only for 52/53-week or off-grid fiscal calendars. The issuer's reported 10-Q/10-K period end and its later publication/availability date remain distinct.
 * **Applied correction**: `python pipeline/paper_portfolio.py --env real correct-periods --cycle-key 2026Q3 --quarter-end 2026-09-30 --apply`.
   The original frozen manifest remains archived as `state/expected_filings/2026Q3.window-pm45d-v1.json`; the active manifest supersedes it and the full delta is in `state/expected_filings/2026Q3.period_correction.json`.
   A, COO and MDT changed from expected period `2026-10-31` to `2026-07-31`.
@@ -405,6 +659,7 @@ static list as a current report count.
 * **Prior run classification**: `20261014T135944Z-fdf707` is preserved as a restricted diagnostic, not a reproducible offline run: its input manifest omits historical sector panels, `code/ml_model.py` and the persistent database. Its `forecast_comparison_35_vs_32.json` filename is also inconsistent with its contents, which record 35 diagnostic and 35 enforced forecasts (35 in both; no differing or one-sided tickers). Do not cite that run as evidence for 32 forecasts.
   The separate earlier run `20261014T121703Z-a8a9ce` did record 35 diagnostic and 32 enforced forecasts: A, COO and MDT were diagnostic-only because the superseded period rule expected 2026-10-31 while the rows used 2026-07-31. The later `20261014T180910Z-2b1fd6` has 58 diagnostic records.
   `state/diagnostics/clarifications/forecast_run_reconciliation_20261014.json` compares the 35-record run with the 58-record run per security, including CIK, periods, current accession/availability, prior forecast/readiness state, and code-hash differences. For all 24 newly forecast securities the old captured filing status was `READY`, but they were not predicted because there was no row in the pending trade-date slot; the later run has each as `READY` with its accession and publication timestamp. The current `_align_cycle_reports` path moves each available expected-period report into a shared next slot, which directly addresses that exclusion reason. However, the old run did not archive its source tree or a consistent DB snapshot, so an exact paired replay cannot prove this was the sole cause; the per-ticker reconciliation keeps unavailable old accession times null rather than guessing. SMCI is the one removed record and remains excluded from the current cycle because its available period is not the expected period. The old run folders remain unchanged.
+* **Quarter-cycle preparation**: a real `tick` or explicitly started `scheduler` prepares the current cycle when no predecessor exists, and only prepares a successor after all strategy portfolios in the prior cycle are `EXECUTED`. The frozen manifest and unique cycle keys make retries/restarts idempotent. This does not start the scheduler or submit broker orders.
   `20261014T173710Z-6375c2` additionally exposed that a 100 % feature threshold leaves too few names for the capped full-investment optimizers; it is retained as an incomplete diagnostic, not a completed threshold comparison.
 * **Completed immutable suite**: `20261014T180910Z-2b1fd6` contains the frozen 2,334-file input snapshot and verified SQLite backup, no network attempts, unchanged before/after manifests, actual per-threshold feature sets, and a complete artifact SHA-256 manifest. It reconciles 503 securities to 500 issuers and reports 59 READY, 1 WAITING_FACTS, 1 evidenced `CORPORATE_ACTION_RESOLVED`, and 439 WAITING_FILING. The 50 %, 75 %, and 100 % runs produce 58, 48, and 14 forecasts; at 100 %, mean/minimum variance are explicitly unavailable because only six names meet the optimizer's 20-name minimum. All run weights remain diagnostic only because the cycle readiness gate is not satisfied. The 35-to-58 record-level comparison identifies 34 shared symbols, SMCI only in the old run, and 24 only in the new run.
 * **Delivery**: the 2026-10-14 baseline report and archive describe run `20261014T180910Z-2b1fd6`; they are historical artifacts and are not overwritten by later verification. The latest full regression result and any later reproducibility archive are recorded separately. Scheduler remains disabled and historical validation remains `NOT_VALIDATED`.
@@ -462,3 +717,228 @@ static list as a current report count.
   SEC User-Agent/contact was configured. Scheduler and orders remain disabled, and historical validation remains
   `NOT_VALIDATED`. See [the final audit report](state/diagnostics/FINAL_REPORT_20261014T195510Z.md) and the
   separately delivered audit ZIP for run outputs, logs, dependencies, and the frozen snapshot.
+
+### Historical continuation and total-return comparison (`paper_fixed_lag-v1`)
+
+This is a separate **research** variant, not a relaxation of the live 100% readiness gate.
+No research command submits orders, enables the scheduler, migrates the production database,
+or turns the October Q2 diagnostic into a historical September signal. Status remains
+`NOT_VALIDATED`. A successful synthetic test or reproducible evidence audit is not a successful
+real-data historical model run.
+
+From the project directory:
+
+```bash
+# Inventory available hybrid panels and source evidence, freeze inputs, audit twice offline:
+.venv/bin/python -m pipeline.fixed_lag_research
+
+# Read-only dashboard using the existing temporary serving copy, not the production database:
+.venv/bin/python -m pipeline.paper_dashboard \
+  --db /tmp/paper-dashboard-8767.sqlite3 --host 127.0.0.1 --port 8767
+```
+
+Open `http://127.0.0.1:8767/?cycle_key=2026Q2#performance`. The existing archive quarter
+selector and publications tab are preserved. The performance tab offers common-period rebasing,
+dates/presets, index-100/cumulative-return/drawdown modes, cursor-centered wheel zoom, dragging,
+joint hover, visible-series switches and CSV export. Instrument search uses only the reviewed
+local registry: ambiguous ISIN/WKN/ticker/name/index matches stay separate. Unknown identifiers
+are not heuristically converted or replaced by price series.
+
+Historical stock/sector views have a separate **Gewichtsquelle / Historisches Datum** control.
+With a reviewed simulation selected, both views use its exact dated holdings and historical
+sectors; they never substitute today's benchmark or the old diagnostic weights. Unavailable
+dated benchmark weights remain unknown, not zero or renormalized. Live/depot information
+remains separate. No live execution means **noch nicht investiert**.
+
+#### Causal research conventions and deliberate deviations
+
+* Q1/Q2/Q3/Q4 execute on June/September/December/March 1, moved to the next NYSE session.
+  Information closes at the preceding NYSE session close; execution uses the following fixed
+  session's close. Intraday timing is an explicit assumption, not an established paper fact.
+* Q2 2026 therefore uses **2026-08-31 20:00 UTC**, execution **2026-09-01 20:00 UTC**.
+  The October-cutoff archive is retained only as a later diagnostic.
+* The original archived last model date is June 1, 2017; the new continuation starts
+  September 1, 2017: 37 decisions through Q2 2026. Paper end values are never spliced into
+  the new NAV. The paper NAV handoff/overlap remains unverified.
+* Historical features must be available at their own decision cutoff. Labels must mature by
+  the current cutoff. This requires a decision-quarter maturity gap before four complete
+  validation quarters and 16–40 contiguous training quarters, checked again after cleaning.
+* Training-only factor removal above 5% missingness, complete cases, no imputation; scaling
+  is fitted on training only. The paper's unspecified stock-deletion heuristic is not claimed
+  identical. Five Python model families use sector validation MSE; their deterministic
+  sklearn settings are **not** the original R/caret hyperparameter search.
+* Selection is `ceil(20% of eligible names)`, descending forecast then security ID. Ties and
+  the old quantile-`>=` selection count are exported. Intercept-only/regularized models can
+  genuinely yield equal predictions; ranking is not evidence of predictive information.
+* Expected quarterly log returns are annualized by four; covariance uses 252 daily log-return
+  observations from the last 253 actual NYSE levels through cutoff. Risk-free return is
+  `log1p(0.015)` annually, an explicit fixed-rate assumption, not a historical yield curve.
+  Target/covariance return definitions must match. Gross-TR targets are supported only as an
+  explicit deviation from the paper's price target, not silently as an exact replication.
+* Long only, full investment, maximum 5% per name, hence at least 20 selected names.
+  Optimizer failures have explicit errors and no substitute weights or silently skipped
+  continuous-performance quarters.
+* The existing share/cash simulator carries holdings, ex-date dividend receivables,
+  pay-date cash, verified actions/delistings and actual turnover across quarters.
+  Gross and net (10bps per trade side) are separate. The prior-close cash baseline preserves
+  initial purchase costs; the portfolio is not reset each quarter. Fractional shares and
+  zero cash interest are explicit research assumptions.
+
+#### Execute a reviewed historical bundle
+
+The existing cache is not automatically certified as a historical source bundle. First supply
+and review the missing source evidence. Then:
+
+```bash
+.venv/bin/python -m pipeline.paper_history_execution \
+  --bundle /absolute/path/to/reviewed-bundle \
+  --output state/research/executions/unique-run-id --start 2017Q2 --end 2026Q2
+# For a standalone Q2 decision, set both --start and --end to 2026Q2.
+# Add --publish to import the replayed research curves/weights into the dashboard registry.
+```
+
+The bundle has exactly these hashed input files, declared in `bundle_manifest.json`
+(`schema_version: 1`, `review_status: SOURCE_REVIEWED`, `files: {filename: sha256}`):
+
+| File | Required content |
+|---|---|
+| `panel.csv` | `security_id,cycle_key,gsector,feature_available_at,reconstruction_status,y_return,label_known_at,label_source_ref,reconstructed_at,period_end,expected_period,period_rule,filing_form,facts_ready_at,acquired_at` plus all 20 `PAPER_FEATURES` columns |
+| `membership.csv` | `security_id,cycle_key,gsector`; omitted prediction securities additionally need reviewed `exclusion_status,exclusion_reason` |
+| `lineage.json` | Keys `cycle:security`; each nonmissing feature maps to its component list, each with `accession,value_version,source_url,published_at` |
+| `raw_prices.csv` | Ascending unique `date` index and security-ID columns, raw unadjusted as-traded prices; no dividend adjustments |
+| `covariance_levels.csv` | Same market-panel shape; source-reviewed levels matching the target return definition; never filled |
+| `corporate_actions.csv` | `action_id,ticker,ex_date,kind,value,pay_date`; empty only with reviewed complete no-action coverage |
+| `definitions.json` | Reviewed definitions and HTTPS `sources`, as specified below |
+
+Required definitions: `currency=USD`, `raw_price_basis=unadjusted_as_traded`,
+`action_coverage=splits_dividends_delistings_verified`, `historical_membership=quarter_end_verified`,
+`historical_sector=point_in_time_verified`, `identity_scope=security_share_class_time_versioned`,
+`source_transition=factor_definitions_overlap_reviewed`,
+`simulation_dividends=receivable_ex_date_cash_pay_date_until_rebalance`.
+Use either `target_definition=forward_execution_split_adjusted_price_log_return` with
+`covariance_definition=split_adjusted_price_log`, or the explicitly different gross-TR pair
+`forward_execution_gross_total_return_log` / `gross_total_return_ex_date_log`.
+
+`calendar-quarter-v2` and the exact issuer-specific `expected_period` are mandatory; 10-K
+versus 10-Q is explicit. Timestamps must have timezones. Acquisition/reconstruction times
+are actual nonfuture times. Unknown operational `facts_ready_at` stays empty. Prediction rows
+need no future return; training/validation rows do need completed, sourced labels.
+Missing historical sectors, unexplained membership omissions, later publications, insufficient
+windows and missing held prices fail explicitly.
+
+The executor freezes inputs/code/configuration, runs independently into `primary/` and
+`replay/`, compares output hashes, verifies source inputs and blocks network connections.
+Exports include actual training/validation rows, feature sets, MSE/forecasts/ties/exclusions,
+target weights, daily NAV/shares/cash/receivables/actual weights/trades, and importer-ready
+comparison CSV/metadata. `execution_summary.json` distinguishes failed and completed runs,
+including optimizer errors. Snapshot hashes and model replay are not historical validation.
+
+#### Reviewed total-return CSV import
+
+```bash
+.venv/bin/python -m pipeline.return_comparison --csv /path/levels.csv --metadata /path/metadata.json
+.venv/bin/python -m pipeline.return_comparison --search US0378331005
+```
+
+CSV columns are exactly `date,value,valued_at`: positive finite levels, unique ascending
+completed valuations, explicit timestamp timezones and no missing declared sessions. For
+`NYSE_close_UTC`, actual session closes including early closes are checked. No forward fill,
+pre-inception values, implicit FX conversion or guessed dividends.
+
+Metadata requires `instrument_id,name,instrument_type,identifiers,share_class,exchange,currency,
+return_type,dividend_tax_basis,reinvestment_rule,cost_basis,source,source_url,valuation_convention,
+calendar,review_status,evidence_files,observed_at`. Types are `stock,etf,index,strategy,paper_reference`;
+identifiers are explicit lists keyed by `ticker,isin,wkn,index_id,strategy_id`. ISIN checksums and
+WKN syntax are validated, but syntax is not issuer identity verification.
+`evidence_files` lists source-definition files relative to the metadata (`path,sha256`).
+Only `USD`, `before_personal_tax`, `SOURCE_REVIEWED`, and documented
+`gross_total_return,etf_total_return,strategy_total_return` are accepted.
+`calendar=EXPLICIT` additionally needs an exact `expected_sessions` list.
+
+Reinvestment is explicitly `ex_date`, `pay_date` or `cash_until_rebalance`; incompatible rules
+cannot be strictly compared. Portfolio receivables/pay-date cash are not silently treated as
+analytical ex-date reinvestment. ETFs must document embedded fees/internal taxes in `cost_basis`;
+the importer does not deduct them again. Optional `weight_history_file,weight_history_sha256`
+add exact dated holdings; every nonmissing benchmark weight needs a dated `benchmark_source`.
+The immutable imported JSON and sidecar hash live under `state/research/comparison/`.
+EUR stays unavailable until sourced historical FX exists.
+
+#### Public-source follow-up, 2026-10-16
+
+The initial audit above is an immutable earlier assessment, not the latest acquisition status.
+SEC access was successfully tested with the user's real, session-only HTTP User-Agent.
+It is neither stored nor supplied to other providers. No licensed provider is assumed necessary.
+Network acquisition and offline evidence review remain separate from model execution.
+
+Actual acquired/reviewed evidence:
+
+* 500 issuer value catalogs and 503 Q2 securities; 498 original cover-page ticker/entity matches.
+  C, MMM, NDAQ and RVTY still require historical class/cover review. SMCI's expected original
+  filing was accepted at 22:21:23 UTC on August 31, after the 20:00 UTC information cutoff.
+* 14,318 current-period or complete-TTM field-component versions were checked. 8,428 match
+  original numeric facts **and context entity IDs**; 5,890 require additional original documents.
+  The earlier 17,543-component inventory included incomplete-TTM candidates and is not the
+  admissible feature-dependency count. 1,055 incomplete TTM chains are exported separately;
+  their stale candidates are not used as current metrics. These are not 498 certified feature rows.
+* Dated public sector snapshots cover 36/37 decision quarters; the 2023Q1 file labels
+  subindustries as `Sector` and is rejected. Q2's HONA/CAG discrepancy was reconciled with
+  the original S&P effective-date announcement: HONA joins June 29; CAG leaves June 30.
+  This yields 503 dated Q2 sector observations, **not** verified historical intervals for 37 quarters.
+* 503 stock chart sources and 29,884 provider action events were acquired. This does not
+  certify raw as-traded prices or complete corporate actions. AVB, EA, EQR and WBD sources
+  currently contain only one daily observation each; 43 null closes occur in two sources.
+  Apple demonstrates a real unit-basis difference: the issuer's May 2017 dividend is
+  $0.63, versus $0.1575 in the provider series (the subsequent 4:1 split basis).
+  Missing pay dates, spinoffs and delisting settlements are not invented.
+* The dashboard registry now contains a genuine State Street **SPY NAV total-return proxy**:
+  2,293 completed daily observations, August 31, 2017 through October 15, 2026, and
+  37 explicit issuer distributions. It analytically reinvests at ex-date NAV; it is neither
+  exchange execution, a pay-date cash ledger, the official S&P total-return index nor a strategy.
+  An independent provider check finds zero SPY split events and all 37 distribution dates,
+  but rounded/different amounts (maximum difference $0.003431); primary issuer amounts remain authoritative.
+
+The admissible component cross-check and its independent offline replay agree. No historical
+August-cutoff model run has started, no strategy weights/NAV have been fabricated, and
+historical validation remains `NOT_VALIDATED`. Historical own-cutoff training/validation,
+source-definition overlap, security intervals and full market/action coverage remain open.
+The old October diagnostic is not reclassified as a September decision. Production databases,
+existing Q2/Q3 manifests, scheduler and orders remain unchanged.
+
+Missing filing evidence is **not** an all-500-READY gate for historical research.
+Each security is classified separately: an evidenced publication after cutoff needs a reviewed
+paper-rule exclusion (including checking earlier original releases); a report published before
+cutoff but not acquired requires acquisition; unresolved identity/value provenance requires
+targeted review. Absence from a cache or incomplete submissions history never proves
+nonpublication. `pipeline.filing_case_review` exports these cases without creating automatic
+exclusions. A filing identity match also does not certify all model features.
+The historical executor already permits reviewed `NOT_PUBLIC_BY_CUTOFF` exclusions and
+rejects acquisition/review gaps disguised as exclusions. A synthetic integration test verifies
+that seven reviewed exclusions still allow the remaining universe to execute and replay.
+Sector coverage, training requirements and optimizer constraints remain unchanged; live
+production readiness is not modified.
+
+Evidence outputs are under `state/research/acquisition/`; the latest hash-verified progress
+pointer is `latest.json`. The dashboard displays it separately from the frozen old audit.
+All commands below run from this project directory and require a new output directory:
+
+```bash
+# Offline original identity review: no SEC contact or network needed.
+.venv/bin/python -m pipeline.filing_identity_evidence \
+  --review-originals state/research/acquisition/20261016-q2-originals-01 \
+  --output state/research/acquisition/NEW-IDENTITY-REVIEW
+
+# Offline current/complete-TTM original-value and issuer-context proof.
+.venv/bin/python -m pipeline.reconcile_historical_evidence \
+  --values state/research/acquisition/20261016-q2-values-01 \
+  --originals state/research/acquisition/20261016-q2-originals-01 \
+  --identities state/research/acquisition/20261016-q2-identity-review-final \
+  --output state/research/acquisition/NEW-COMPONENT-REVIEW
+
+# Optional new primary SPY acquisition (network); --publish explicitly imports the proxy.
+.venv/bin/python -m pipeline.spy_primary_comparison \
+  --output state/research/acquisition/NEW-SPY-REVIEW --publish
+
+# Read-only dashboard; this is not permanent scheduler operation.
+.venv/bin/python -m pipeline.paper_dashboard \
+  --db /tmp/paper-dashboard-8767.sqlite3 --host 127.0.0.1 --port 8767
+```

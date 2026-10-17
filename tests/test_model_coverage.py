@@ -1,5 +1,6 @@
 """Regression tests for the model-coverage fixes (synthetic inputs only, no network)."""
 import json
+import sqlite3
 import sys
 import tempfile
 import unittest
@@ -100,6 +101,41 @@ class ManifestUniverse(unittest.TestCase):
             self.assertEqual(provider.universe_as_of, pd.Timestamp("2026-09-30"))
             with self.assertRaises(pl.MissingDataError):
                 provider.prepare_cycle("missing")
+
+
+class PersistedCycleTimeline(unittest.TestCase):
+    def database(self, facts_ready_column=True):
+        connection = sqlite3.connect(":memory:")
+        connection.executescript(
+            "CREATE TABLE reporting_cycles (cycle_id TEXT, cycle_key TEXT, strategy TEXT);"
+            "CREATE TABLE filing_resolutions (cycle_id TEXT, filing_key TEXT, recorded_at TEXT);"
+        )
+        timestamp_column = ", facts_ready_at TEXT" if facts_ready_column else ""
+        connection.execute(
+            "CREATE TABLE expected_filings (cycle_id TEXT, filing_key TEXT, filed_at TEXT, "
+            "first_seen_at TEXT" + timestamp_column + ")"
+        )
+        connection.execute("INSERT INTO reporting_cycles VALUES ('c', '2026Q3', 'equal_weight_v1')")
+        return connection
+
+    def test_timeline_reads_mapping_rows_and_rejects_missing_schema_explicitly(self):
+        connection = self.database()
+        connection.execute(
+            "INSERT INTO expected_filings VALUES (?, ?, ?, ?, ?)",
+            ("c", "filing", "2026-10-13T18:00:00+00:00", "2026-10-14T01:00:00+00:00",
+             "2026-10-14T02:00:00+00:00"),
+        )
+        rows = mc._cycle_timeline_rows(connection, "2026Q3")
+        self.assertEqual(
+            mc.cycle_timeline(rows)["snapshot_as_of"],
+            "2026-10-14T02:00:00+00:00",
+        )
+        connection.close()
+
+        connection = self.database(facts_ready_column=False)
+        with self.assertRaisesRegex(ValueError, "schema 0 lacks expected_filings.facts_ready_at"):
+            mc._cycle_timeline_rows(connection, "2026Q3")
+        connection.close()
 
 
 class DividendPayDate(unittest.TestCase):

@@ -205,7 +205,24 @@ def run_cli(argv: list[str] | None = None) -> None:
         spec = args.adapters or ("paper_live:real_adapters" if args.env == "real" else None)
         if spec is None:
             parser.error("--adapters is required for the synthetic environment")
-        runner = PaperRunner(store, load_adapters(spec), RunnerConfig())
+        cycle_preparer = None
+        data_refresher = None
+        if args.env == "real" and args.command in {"tick", "scheduler"}:
+            try:
+                from . import benchmark_weights
+                from .paper_live import prepare_next_real_cycle
+            except ImportError:
+                import benchmark_weights  # type: ignore[no-redef]
+                from paper_live import prepare_next_real_cycle  # type: ignore[no-redef]
+            cycle_preparer = lambda: prepare_next_real_cycle(store, real_config)
+            data_refresher = lambda: benchmark_weights.fetch_if_stale()
+        runner = PaperRunner(
+            store,
+            load_adapters(spec),
+            RunnerConfig(),
+            cycle_preparer=cycle_preparer,
+            data_refresher=data_refresher,
+        )
         if args.command == "check-filings":
             with exclusive_lock(store.path):
                 print(json.dumps(runner.check_filings(args.cycle_key), default=str))

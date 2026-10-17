@@ -68,8 +68,8 @@ class StoreMigrationTests(unittest.TestCase):
         version = con.execute("PRAGMA user_version").fetchone()[0]
         con.close()
         result = PaperStore.migrate(copy, "real", self.dir / "bk")
-        self.assertEqual(result["to_version"], 5)
-        if version < 5:
+        self.assertEqual(result["to_version"], 6)
+        if version < 6:
             self.assertTrue(Path(result["backup"]).exists())
         con = sqlite3.connect(copy)
         after = con.execute("SELECT portfolio_id, created_at FROM portfolios ORDER BY 1").fetchall()

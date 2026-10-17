@@ -490,6 +490,53 @@ def create_real_cycle(store: PaperStore, config: Mapping[str, object], cycle_key
     return {"cycle_key": cycle_key, "expected_reports": len(keys), "manifest": str(path), "cycles": cycles}
 
 
+def prepare_next_real_cycle(
+    store: PaperStore,
+    config: Mapping[str, object],
+    now: datetime | None = None,
+) -> dict[str, object]:
+    """Idempotently prepare the current/next calendar cycle after its predecessor completes."""
+    if store.environment() != "real":
+        raise ValidationError("automatic cycle preparation requires a real store")
+    current_date = pd.Timestamp(now or datetime.now(timezone.utc))
+    if current_date.tzinfo is not None:
+        current_date = current_date.tz_convert("UTC").tz_localize(None)
+    current_period = current_date.to_period("Q")
+    rows = store.query("SELECT cycle_key, portfolio_id, status FROM reporting_cycles")
+    if not rows:
+        target_period = current_period - 1
+    else:
+        latest_key = max(str(row["cycle_key"]) for row in rows)
+        try:
+            year, quarter = latest_key.split("Q", 1)
+            latest_period = pd.Period(f"{int(year)}Q{int(quarter)}", freq="Q")
+        except (ValueError, TypeError) as exc:
+            raise ValidationError(f"unsupported reporting cycle key: {latest_key}") from exc
+        latest_rows = [row for row in rows if str(row["cycle_key"]) == latest_key]
+        by_portfolio = {str(row["portfolio_id"]): str(row["status"]) for row in latest_rows}
+        if set(by_portfolio) != set(STRATEGY_IDS):
+            return {
+                "status": "WAITING_FOR_COMPLETE_COHORT",
+                "cycle_key": latest_key,
+                "portfolios_present": sorted(by_portfolio),
+            }
+        if any(status != "EXECUTED" for status in by_portfolio.values()):
+            return {
+                "status": "WAITING_FOR_PREDECESSOR",
+                "cycle_key": latest_key,
+                "portfolio_statuses": by_portfolio,
+            }
+        target_period = latest_period + 1
+    quarter_end = target_period.end_time.date().isoformat()
+    prepared = create_real_cycle(
+        store,
+        config,
+        str(target_period),
+        quarter_end,
+    )
+    return {"status": "PREPARED", **prepared}
+
+
 def correct_expected_periods(store: PaperStore, config: Mapping[str, object], cycle_key: str,
                              quarter_end: str, apply: bool = False) -> dict[str, object]:
     with exclusive_lock(store.path):
@@ -637,16 +684,28 @@ class SecFilingSource:
         names = self.required if required is None else required
         fallback: dict[str, list[dict]] | None = None
 
+        def expected_units(field: str) -> frozenset[str]:
+            if field == "EPS_Basic":
+                return frozenset({"USD/SHARES"})
+            if field == "SharesOutstanding":
+                return frozenset({"SHARES"})
+            if field in se.DURATION_TAGS or field in se.INSTANT_TAGS:
+                return frozenset({"USD"})
+            return frozenset()
+
+        def normalize_unit(unit: str) -> str:
+            return "/".join(part.strip().upper().split(":")[-1] for part in unit.split("/"))
+
         def usable(
+            field: str,
             entry: Mapping[str, object],
             unit: str,
             provenance: Mapping[str, object] | None = None,
         ) -> bool:
             value = entry.get("val")
             end = entry.get("end")
-            normalized_unit = unit.upper().split(":")[-1]
-            if (entry.get("accn") != accession or len(normalized_unit) != 3
-                    or not normalized_unit.isalpha() or value is None
+            if (entry.get("accn") != accession or normalize_unit(unit) not in expected_units(field)
+                    or value is None
                     or isinstance(value, bool) or end is None):
                 return False
             try:
@@ -669,7 +728,7 @@ class SecFilingSource:
 
         for name in names:
             companyfacts_has_value = any(
-                usable(entry, unit)
+                usable(name, entry, unit)
                 for tag in tags[name]
                 for unit, entries in (gaap.get(tag, {}).get("units") or {}).items()
                 for entry in entries
@@ -685,7 +744,7 @@ class SecFilingSource:
             for entry in fallback.get(name, []):
                 provenance = entry.get("_prov")
                 if isinstance(provenance, Mapping) and usable(
-                    entry, str(provenance.get("unit") or ""), provenance
+                    name, entry, str(provenance.get("unit") or ""), provenance
                 ):
                     fallback_has_value = True
                     break

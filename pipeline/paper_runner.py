@@ -25,12 +25,14 @@ try:
         DuplicateRecordError, JobStatus, NotFoundError, OrderRequest, OrderSide, PaperStore,
         StateError, ValidationError,
     )
+    from .paper_timeline import cycle_timeline
 except ImportError:  # pragma: no cover - script execution
     from market_calendar import nyse_schedule, nyse_sessions, previous_nyse_session, session_close_time  # type: ignore
     from paper_store import (  # type: ignore
         DuplicateRecordError, JobStatus, NotFoundError, OrderRequest, OrderSide, PaperStore,
         StateError, ValidationError,
     )
+    from paper_timeline import cycle_timeline  # type: ignore
 
 
 BENCHMARK_STRATEGY = "spy_buy_hold_v1"
@@ -57,6 +59,7 @@ class FilingObservation:
     filed_at: str | None = None  # SEC acceptance timestamp (publication time), timezone-aware
     source: str = ""
     error_reason: str | None = None
+    facts_ready_at: str | None = None  # first observed time all required current facts were available
 
 
 @dataclass(frozen=True)
@@ -157,6 +160,8 @@ class PaperRunner:
         adapters: Adapters,
         config: RunnerConfig | None = None,
         clock: Callable[[], datetime] | None = None,
+        cycle_preparer: Callable[[], Mapping[str, object] | None] | None = None,
+        data_refresher: Callable[[], Mapping[str, object] | None] | None = None,
     ) -> None:
         self.store = store
         self.adapters = adapters
@@ -168,6 +173,8 @@ class PaperRunner:
                 "real paper tracking and synthetic demos must stay separate"
             )
         self._clock = clock or (lambda: datetime.now(timezone.utc))
+        self._cycle_preparer = cycle_preparer
+        self._data_refresher = data_refresher
 
     def now(self) -> pd.Timestamp:
         return pd.Timestamp(self._clock()).tz_convert("UTC")
@@ -257,7 +264,8 @@ class PaperRunner:
         def work(run_id: str) -> None:
             pending = {str(r["filing_key"]) for r in self.store.query(
                 "SELECT filing_key FROM expected_filings WHERE cycle_id = ? "
-                "AND (received = 0 OR facts_ready = 0)", (cycles[0]["cycle_id"],))}
+                "AND (received = 0 OR facts_ready = 0 OR "
+                "(facts_ready = 1 AND facts_ready_at IS NULL))", (cycles[0]["cycle_id"],))}
             to_observe = [{k: str(v) for k, v in e.items()} for e in expected
                           if str(e["filing_key"]) in pending]
             observed = self.adapters.filings.observe(to_observe) if to_observe else {}
@@ -274,6 +282,9 @@ class PaperRunner:
                     received = bool(row["received"]) or obs.received
                     facts = bool(row["facts_ready"]) or obs.facts_ready
                     filed_at = row["filed_at"] or obs.filed_at
+                    facts_ready_at = row["facts_ready_at"] or obs.facts_ready_at
+                    if facts and facts_ready_at is None:
+                        facts_ready_at = _iso(now)
                     valid = obs.valid
                     reason = obs.error_reason
                     if received and not filed_at:
@@ -286,11 +297,11 @@ class PaperRunner:
                         valid, reason = False, "filed_at lies in the future"
                     new = (received, facts, valid, filed_at)
                     if new == (bool(row["received"]), bool(row["facts_ready"]),
-                               bool(row["valid"]), row["filed_at"]):
+                               bool(row["valid"]), row["filed_at"]) and facts_ready_at == row["facts_ready_at"]:
                         continue
                     self.store.set_filing_result(
                         cid, str(row["filing_key"]), received=received, facts_ready=facts,
-                        valid=valid, filed_at=filed_at,
+                        valid=valid, filed_at=filed_at, facts_ready_at=facts_ready_at,
                         first_seen_at=row["first_seen_at"] or _iso(now),
                         source=obs.source or None, error_reason=reason, updated_at=_iso(now),
                     )
@@ -345,31 +356,16 @@ class PaperRunner:
     def _timeline_inputs(self, cycle: Mapping[str, object]) -> dict[str, str]:
         """Use actual filing timestamps plus recorded special-case evidence, never invented filing times."""
         rows = self.store.query(
-            "SELECT e.filing_key, e.filed_at, e.first_seen_at, r.recorded_at "
+            "SELECT e.filing_key, e.filed_at, e.first_seen_at, e.facts_ready_at, r.recorded_at "
             "FROM expected_filings e LEFT JOIN filing_resolutions r "
             "ON r.cycle_id = e.cycle_id AND r.filing_key = e.filing_key "
             "WHERE e.cycle_id = ?",
             (cycle["cycle_id"],),
         )
-        published, seen = [], []
-        for r in rows:
-            p, f = _aware_utc(r["filed_at"]), _aware_utc(r["first_seen_at"])
-            resolved_at = _aware_utc(r["recorded_at"])
-            if resolved_at is not None:
-                seen.append(resolved_at)
-                continue
-            if p is None or f is None:
-                raise ValidationError(f"filing {r['filing_key']} needs timezone-aware publication and first-seen times")
-            published.append(p)
-            seen.append(f)
-        if not published:
-            raise ValidationError("cycle has no published filing timestamp; resolutions cannot supply one")
-        latest_seen = max(seen)
-        latest_published = max(published)
-        if latest_seen < latest_published:
-            raise ValidationError("first-seen evidence time precedes a filing publication time")
-        return {"published_at": _iso(max(published)), "first_seen_at": _iso(latest_seen),
-                "snapshot_as_of": _iso(latest_seen)}
+        try:
+            return cycle_timeline(rows)
+        except ValueError as exc:
+            raise ValidationError(str(exc)) from exc
 
     def _signal_work(self, cycle_key: str, cycles: list[dict[str, object]]) -> None:
         now = self.now()
@@ -691,6 +687,22 @@ class PaperRunner:
         with exclusive_lock(self.store.path):
             recovered = self.recover_interrupted()
             outcome: dict[str, object] = {"recovered_jobs": recovered, "signals": {}}
+            if self._data_refresher is not None:
+                refreshed: dict[str, object] = {}
+
+                def refresh_work(run_id: str) -> None:
+                    result = self._data_refresher()
+                    if result is not None:
+                        refreshed.update(result)
+                    self.store.log_job_event(
+                        run_id, "data_refresh", refreshed, created_at=_iso(self.now())
+                    )
+
+                refresh_base = f"data-refresh:spy:{self.now().date().isoformat()}"
+                status, _ = self._job(refresh_base, "data_refresh", {"source": "SPY holdings"}, refresh_work)
+                outcome["data_refresh"] = {"job_status": status, "result": refreshed}
+            if self._cycle_preparer is not None:
+                outcome["cycle_preparation"] = self._cycle_preparer()
             for key in self.open_cycle_keys():
                 self.check_filings(key)
                 outcome["signals"][key] = self.run_signal(key)  # type: ignore[index]
